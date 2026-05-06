@@ -62,12 +62,11 @@ function SearchHandler.searchPhotos(args)
     local total = 0
 
     catalog:withReadAccessDo(function()
-        local matches
-        if hasFilters then
-            matches = catalog:findPhotos{ searchDesc = searchDesc }
-        else
-            matches = catalog:getAllPhotos()
-        end
+        -- Unrated photos have nil rating; rating>=0 excludes them, so getAllPhotos()
+        -- must be used when no filters are specified.
+        local matches = hasFilters
+            and catalog:findPhotos{ searchDesc = searchDesc }
+            or catalog:getAllPhotos()
 
         total = #matches
         local last = math.min(offset + limit, total)
@@ -79,11 +78,17 @@ function SearchHandler.searchPhotos(args)
     logger:info(string.format("Search matched %d photos, returning %d (offset=%d, limit=%d)",
         total, #results, offset, limit))
 
-    return {
+    local response = {
         count = total,
         photos = results,
         has_more = (offset + #results) < total,
     }
+
+    if not hasFilters then
+        response.warning = "No filters applied — scanned full catalog. Provide filename, keywords, rating, or date filters to narrow results and improve performance."
+    end
+
+    return response
 end
 
 return SearchHandler

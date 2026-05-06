@@ -58,6 +58,9 @@ if _G.LightroomMCP_State and _G.LightroomMCP_State.running then
     local old = _G.LightroomMCP_State
     logger:info("Reload detected - stopping previous server instance")
     old.running = false
+    -- Close sockets immediately so ports are free before the new task binds.
+    -- The old loop exits on its next 0.2 s tick; PluginInit sleeps 0.5 s
+    -- before calling startServer() to ensure the old context has flushed.
     if old.requestSocket then
         pcall(function() old.requestSocket:close() end)
     end
@@ -231,6 +234,21 @@ local function startServer()
     addLog("Starting LrSocket servers")
 
     LrFunctionContext.postAsyncTaskWithContext("LightroomMCPServer", function(context)
+        context:addCleanupHandler(function()
+            addLog("Server task context cleanup")
+            if pluginState.requestSocket then
+                pcall(function() pluginState.requestSocket:close() end)
+            end
+            if pluginState.responseSocket then
+                pcall(function() pluginState.responseSocket:close() end)
+            end
+            pluginState.requestSocket = nil
+            pluginState.responseSocket = nil
+            pluginState.sendConnected = false
+            pluginState.receiveConnected = false
+            pluginState.token = nil
+        end)
+
         local function bindRequest()
             return LrSocket.bind {
                 functionContext = context,
@@ -347,17 +365,7 @@ local function startServer()
         end
 
         addLog("Server loop exiting")
-        if pluginState.requestSocket then
-            pcall(function() pluginState.requestSocket:close() end)
-        end
-        if pluginState.responseSocket then
-            pcall(function() pluginState.responseSocket:close() end)
-        end
-        pluginState.requestSocket = nil
-        pluginState.responseSocket = nil
-        pluginState.sendConnected = false
-        pluginState.receiveConnected = false
-        pluginState.token = nil
+        -- Socket cleanup runs in context:addCleanupHandler above.
     end)
 end
 

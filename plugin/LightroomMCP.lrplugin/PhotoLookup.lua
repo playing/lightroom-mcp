@@ -7,28 +7,26 @@ local PhotoLookup = {}
 --   results[i] = { id = inputId, photo = photoOrNil }
 function PhotoLookup.resolveMany(catalog, photoIds)
     local results = {}
-    local missingIdx = {}
-
     for i, id in ipairs(photoIds) do
-        local photo = nil
-        local numId = tonumber(id)
-        if numId then
-            photo = catalog:findPhotoByLocalIdentifier(numId)
-        end
-        results[i] = { id = id, photo = photo }
-        if not photo then
-            table.insert(missingIdx, i)
-        end
+        results[i] = { id = id, photo = nil }
     end
 
-    if #missingIdx > 0 then
-        local byPath = {}
-        for _, p in ipairs(catalog:getAllPhotos()) do
-            byPath[p:getRawMetadata('path')] = p
-        end
-        for _, idx in ipairs(missingIdx) do
-            results[idx].photo = byPath[results[idx].id]
-        end
+    -- LrCatalog has no findPhotoByLocalIdentifier; one getAllPhotos pass
+    -- builds both id and path indexes. localIdentifier is numeric in
+    -- production but tests pass strings — normalize via tostring.
+    local byLocalId = {}
+    local byPath = {}
+    for _, p in ipairs(catalog:getAllPhotos()) do
+        local lid = p.localIdentifier
+        if lid ~= nil then byLocalId[tostring(lid)] = p end
+        local path = p:getRawMetadata('path')
+        if path ~= nil then byPath[path] = p end
+    end
+
+    for i, id in ipairs(photoIds) do
+        local photo = byLocalId[tostring(id)]
+        if not photo then photo = byPath[id] end
+        results[i].photo = photo
     end
 
     return results

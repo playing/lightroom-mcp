@@ -14,6 +14,11 @@ local function loadInit(opts)
     local prefs = { autoStartServer = opts.autoStartServer }
 
     package.loaded.PluginInfoProvider = {
+        -- PluginInit calls this on load/reload to tear down a stale instance
+        -- before auto-start (issues #121, #137); stub it so the require runs.
+        resetForReload = function()
+            observed.resetForReload = true
+        end,
         startServer = function()
             if opts.startServerError then
                 error(opts.startServerError)
@@ -66,6 +71,8 @@ describe("PluginInit auto-start", function()
         assert.is_true(o.usedPostAsyncTaskWithContext)
         assert.is_false(o.usedStartAsyncTask)
         assert.is_true(o.started)
+        -- Reload teardown runs before auto-start (issues #121, #137).
+        assert.is_true(o.resetForReload)
     end)
 
     it("does not start the server when auto-start is disabled", function()

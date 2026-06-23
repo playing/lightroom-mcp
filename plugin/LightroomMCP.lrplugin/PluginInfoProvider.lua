@@ -46,30 +46,16 @@ local function readPortPrefs()
     return req, res
 end
 
--- State on _G so it survives "Reload Plug-in" within the same Lua state.
--- This module body executes BOTH when PluginInit requires it AND when
--- Lr loads it as the InfoProvider, so it can run twice in quick
--- succession. We must not blow away an existing state on the second
--- load, otherwise we end up with two pluginState tables, two LrSocket
--- binds, two tokens, and connections land on whichever listener the
--- kernel hands the accept to — usually the wrong one.
-if _G.LightroomMCP_State and _G.LightroomMCP_State.running then
-    -- True Reload Plug-in of a running server: tear down the old loop.
-    local old = _G.LightroomMCP_State
-    logger:info("Reload detected - stopping previous server instance")
-    old.running = false
-    -- Close sockets immediately so ports are free before the new task binds.
-    -- The old loop exits on its next 0.2 s tick; PluginInit sleeps 0.5 s
-    -- before calling startServer() to ensure the old context has flushed.
-    if old.requestSocket then
-        pcall(function() old.requestSocket:close() end)
-    end
-    if old.responseSocket then
-        pcall(function() old.responseSocket:close() end)
-    end
-    _G.LightroomMCP_State = nil
-end
-
+-- State on _G so it survives across re-execution of this module body
+-- within the same Lua state. This body runs BOTH when PluginInit requires
+-- it AND every time Lightroom loads it as the InfoProvider to render the
+-- Plug-in Manager panel. A render must NOT disturb a running server, so we
+-- only ever CREATE state here (when absent) — never tear it down. Teardown
+-- of a stale prior instance on Reload Plug-in is handled by resetForReload,
+-- which PluginInit calls (PluginInit's LrInitPlugin runs on load/reload but
+-- NOT on a plain panel render). Tearing down from this body — as earlier
+-- versions did when running == true — killed the live server every time the
+-- Plug-in Manager was opened (issues #121, #137).
 if not _G.LightroomMCP_State then
     _G.LightroomMCP_State = {
         running = false,
@@ -252,10 +238,27 @@ local function startServer()
     pluginState.responsePort = responsePort
 
     pluginState.running = true
+    -- Tag this invocation. resetForReload reuses the same _G state table in
+    -- place, so a prior instance's async context-cleanup handler (registered
+    -- below) and this fresh start share one table. If that old cleanup fires
+    -- AFTER we rebind here it would close the new sockets and wipe the new
+    -- token, leaving a dead-but-running server (issues #121, #137). The
+    -- handler captures this id and skips teardown once superseded (mirrors
+    -- responseGen). Bumped in the synchronous prologue so the id is live
+    -- before the old cleanup can interleave with the new binds.
+    pluginState.instanceId = (pluginState.instanceId or 0) + 1
+    local instanceId = pluginState.instanceId
     addLog("Starting LrSocket servers")
 
     LrFunctionContext.postAsyncTaskWithContext("LightroomMCPServer", function(context)
         context:addCleanupHandler(function()
+            if pluginState.instanceId ~= instanceId then
+                -- A newer startServer superseded this instance; its sockets
+                -- and token now own the shared state table. Tearing them down
+                -- here would kill the live server, so leave them be.
+                addLog("Stale cleanup skipped (instance " .. instanceId .. " superseded)")
+                return
+            end
             addLog("Server task context cleanup")
             if pluginState.requestSocket then
                 pcall(function() pluginState.requestSocket:close() end)
@@ -322,6 +325,13 @@ local function startServer()
         -- listener can flag rebind AGAIN immediately after we just
         -- finished rebinding, looping us out of the new client.
         pluginState.responseGen = 0
+        -- Clear loop-control flags so a reused state table (in-place
+        -- resetForReload, or a panel Stop->Start) doesn't enter the monitor
+        -- loop with a stale reconnect/rebind pending and churn the sockets we
+        -- just bound on the first tick.
+        pluginState.requestNeedsReconnect = false
+        pluginState.responseNeedsRebind = false
+        pluginState.responseNeedsReconnect = false
 
         -- bindResponse takes myGen explicitly so callers can pre-bump the
         -- generation BEFORE calling :close() on the prior listener. On
@@ -423,11 +433,50 @@ local function stopServer()
     pluginState.running = false
 end
 
+-- Called by PluginInit on plugin load/reload (never on a Plug-in Manager
+-- render). Reload re-runs PluginInit while a prior instance's state may
+-- still live on _G in the same Lua state, with `running` stale-true and
+-- its task context already cancelled by Lightroom. Clear the flag so the
+-- subsequent startServer() isn't blocked by its "Already running" guard,
+-- and signal any surviving monitor loop to exit. Reset IN PLACE (not a new
+-- table) so this module's pluginState and the old loop's closure keep
+-- pointing at the same table — flipping running here is what stops it.
+local function resetForReload()
+    if not pluginState.running then return end
+    addLog("Reload detected - resetting previous server instance")
+    pluginState.running = false
+    if pluginState.requestSocket then
+        pcall(function() pluginState.requestSocket:close() end)
+    end
+    if pluginState.responseSocket then
+        pcall(function() pluginState.responseSocket:close() end)
+    end
+    pluginState.requestSocket = nil
+    pluginState.responseSocket = nil
+    pluginState.sendConnected = false
+    pluginState.receiveConnected = false
+    pluginState.token = nil
+    -- Return the rest of the transient runtime state to fresh-state defaults
+    -- so the Plug-in Manager reports honest status after a reload (no
+    -- carried-over lastEvent / counters / ports) and the next startServer
+    -- can't inherit a stale reconnect/rebind request. instanceId is
+    -- deliberately NOT reset -- it must keep advancing so a superseded
+    -- instance's cleanup handler stays a no-op (see startServer).
+    pluginState.requestNeedsReconnect = false
+    pluginState.responseNeedsRebind = false
+    pluginState.responseNeedsReconnect = false
+    pluginState.lastEvent = nil
+    pluginState.requestsProcessed = 0
+    pluginState.requestPort = nil
+    pluginState.responsePort = nil
+end
+
 addLog("PluginInfoProvider loaded")
 
 local PluginInfoProvider = {
     startServer = startServer,
     stopServer = stopServer,
+    resetForReload = resetForReload,
 }
 
 function PluginInfoProvider.sectionsForTopOfDialog(f, propertyTable)

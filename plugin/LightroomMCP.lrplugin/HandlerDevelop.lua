@@ -225,10 +225,22 @@ local function buildColorGradingWheelSettings(wheel, values, out)
     for component, value in pairs(values) do
         if component == "Hue" then
             requireNumberInRange(value, "adjustments.color_grading." .. wheel .. ".Hue", 0, 360)
-            out["ColorGrade" .. wheel .. "Hue"] = value
+            if wheel == "Shadow" then
+                out.SplitToningShadowHue = value
+            elseif wheel == "Highlight" then
+                out.SplitToningHighlightHue = value
+            else
+                out["ColorGrade" .. wheel .. "Hue"] = value
+            end
         elseif component == "Sat" then
             requireNumberInRange(value, "adjustments.color_grading." .. wheel .. ".Sat", 0, 100)
-            out["ColorGrade" .. wheel .. "Sat"] = value
+            if wheel == "Shadow" then
+                out.SplitToningShadowSaturation = value
+            elseif wheel == "Highlight" then
+                out.SplitToningHighlightSaturation = value
+            else
+                out["ColorGrade" .. wheel .. "Sat"] = value
+            end
         elseif component == "Lum" then
             requireNumberInRange(value, "adjustments.color_grading." .. wheel .. ".Lum", -100, 100)
             out["ColorGrade" .. wheel .. "Lum"] = value
@@ -250,6 +262,7 @@ local function buildColorGradingSettings(colorGrading, out)
         elseif key == "Balance" then
             requireNumberInRange(value, "adjustments.color_grading.Balance", -100, 100)
             out.ColorGradeBalance = value
+            out.SplitToningBalance = value
         else
             error("Unsupported color grading key: " .. tostring(key))
         end

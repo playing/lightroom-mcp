@@ -222,6 +222,18 @@ describe('color adjustment schema', () => {
       'Blue',
     ]);
   });
+
+  it('maps shadow and highlight hue/sat through Lightroom split-toning SDK keys', () => {
+    const pluginPath = path.resolve(process.cwd(), '..', 'plugin', 'LightroomMCP.lrplugin', 'HandlerDevelop.lua');
+    const source = fs.readFileSync(pluginPath, 'utf8');
+
+    expect(source).toContain('out.SplitToningShadowHue = value');
+    expect(source).toContain('out.SplitToningShadowSaturation = value');
+    expect(source).toContain('out.SplitToningHighlightHue = value');
+    expect(source).toContain('out.SplitToningHighlightSaturation = value');
+    expect(source).toContain('out["ColorGrade" .. wheel .. "Hue"] = value');
+    expect(source).toContain('out["ColorGrade" .. wheel .. "Sat"] = value');
+  });
 });
 
 describe('tool contracts vs Lua dispatch', () => {

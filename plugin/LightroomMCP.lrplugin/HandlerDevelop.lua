@@ -6,6 +6,27 @@ local Log = require 'Log'
 local DevelopHandler = {}
 
 local MAX_BULK_PHOTO_IDS = 1000
+local HSL_CHANNELS = {
+    Red = true,
+    Orange = true,
+    Yellow = true,
+    Green = true,
+    Aqua = true,
+    Blue = true,
+    Purple = true,
+    Magenta = true,
+}
+local COLOR_GRADING_WHEELS = {
+    Shadow = true,
+    Midtone = true,
+    Highlight = true,
+    Global = true,
+}
+local CALIBRATION_CHANNELS = {
+    Red = true,
+    Green = true,
+    Blue = true,
+}
 
 local ALLOWED_DEVELOP_SETTING_KEYS = {
     "WhiteBalance",
@@ -146,6 +167,136 @@ local function requireDevelopSettingWhitelist(settings)
     end
 end
 
+local function requireObject(value, name)
+    if type(value) ~= "table" then
+        error(name .. " is required")
+    end
+end
+
+local function requireNumberInRange(value, name, minValue, maxValue)
+    if type(value) ~= "number" then
+        error(name .. " must be a number")
+    end
+    if value < minValue or value > maxValue then
+        error(name .. " must be between " .. tostring(minValue) .. " and " .. tostring(maxValue))
+    end
+end
+
+local function requireNonEmptyObject(value, name)
+    requireObject(value, name)
+
+    local count = 0
+    for _ in pairs(value) do
+        count = count + 1
+    end
+
+    if count == 0 then
+        error(name .. " is required")
+    end
+end
+
+local function buildHslSettings(hsl, out)
+    requireNonEmptyObject(hsl, "adjustments.hsl")
+
+    for channel, values in pairs(hsl) do
+        if not HSL_CHANNELS[channel] then
+            error("Unsupported HSL channel: " .. tostring(channel))
+        end
+        requireNonEmptyObject(values, "adjustments.hsl." .. channel)
+
+        for component, value in pairs(values) do
+            requireNumberInRange(value, "adjustments.hsl." .. channel .. "." .. tostring(component), -100, 100)
+            if component == "Hue" then
+                out["HueAdjustment" .. channel] = value
+            elseif component == "Saturation" then
+                out["SaturationAdjustment" .. channel] = value
+            elseif component == "Luminance" then
+                out["LuminanceAdjustment" .. channel] = value
+            else
+                error("Unsupported HSL component: " .. tostring(component))
+            end
+        end
+    end
+end
+
+local function buildColorGradingWheelSettings(wheel, values, out)
+    requireNonEmptyObject(values, "adjustments.color_grading." .. wheel)
+
+    for component, value in pairs(values) do
+        if component == "Hue" then
+            requireNumberInRange(value, "adjustments.color_grading." .. wheel .. ".Hue", 0, 360)
+            out["ColorGrade" .. wheel .. "Hue"] = value
+        elseif component == "Sat" then
+            requireNumberInRange(value, "adjustments.color_grading." .. wheel .. ".Sat", 0, 100)
+            out["ColorGrade" .. wheel .. "Sat"] = value
+        elseif component == "Lum" then
+            requireNumberInRange(value, "adjustments.color_grading." .. wheel .. ".Lum", -100, 100)
+            out["ColorGrade" .. wheel .. "Lum"] = value
+        else
+            error("Unsupported color grading component: " .. tostring(component))
+        end
+    end
+end
+
+local function buildColorGradingSettings(colorGrading, out)
+    requireNonEmptyObject(colorGrading, "adjustments.color_grading")
+
+    for key, value in pairs(colorGrading) do
+        if COLOR_GRADING_WHEELS[key] then
+            buildColorGradingWheelSettings(key, value, out)
+        elseif key == "Blending" then
+            requireNumberInRange(value, "adjustments.color_grading.Blending", 0, 100)
+            out.ColorGradeBlending = value
+        elseif key == "Balance" then
+            requireNumberInRange(value, "adjustments.color_grading.Balance", -100, 100)
+            out.ColorGradeBalance = value
+        else
+            error("Unsupported color grading key: " .. tostring(key))
+        end
+    end
+end
+
+local function buildCalibrationSettings(calibration, out)
+    requireNonEmptyObject(calibration, "adjustments.calibration")
+
+    for channel, values in pairs(calibration) do
+        if not CALIBRATION_CHANNELS[channel] then
+            error("Unsupported calibration channel: " .. tostring(channel))
+        end
+        requireNonEmptyObject(values, "adjustments.calibration." .. channel)
+
+        for component, value in pairs(values) do
+            requireNumberInRange(value, "adjustments.calibration." .. channel .. "." .. tostring(component), -100, 100)
+            if component == "Hue" then
+                out[channel .. "Hue"] = value
+            elseif component == "Saturation" then
+                out[channel .. "Saturation"] = value
+            else
+                error("Unsupported calibration component: " .. tostring(component))
+            end
+        end
+    end
+end
+
+local function buildColorAdjustmentSettings(adjustments)
+    requireNonEmptyObject(adjustments, "adjustments")
+
+    local out = {}
+    for group, value in pairs(adjustments) do
+        if group == "hsl" then
+            buildHslSettings(value, out)
+        elseif group == "color_grading" then
+            buildColorGradingSettings(value, out)
+        elseif group == "calibration" then
+            buildCalibrationSettings(value, out)
+        else
+            error("Unsupported color adjustment group: " .. tostring(group))
+        end
+    end
+
+    return out
+end
+
 local function findPresetByName(name)
     for _, folder in ipairs(LrApplication.developPresetFolders()) do
         for _, preset in ipairs(folder:getDevelopPresets()) do
@@ -275,6 +426,31 @@ function DevelopHandler.setDevelopSettings(args)
     return {
         success = applied,
         photo_id = args.photo_id,
+    }
+end
+
+function DevelopHandler.setColorAdjustments(args)
+    requireString(args.photo_id, "photo_id")
+    local settings = buildColorAdjustmentSettings(args.adjustments)
+
+    local catalog = LrApplication.activeCatalog()
+    local applied = false
+
+    catalog:withWriteAccessDo("Set Color Adjustments", function()
+        local photo = PhotoLookup.resolveOne(catalog, args.photo_id)
+        if not photo then
+            error("Photo not found: " .. args.photo_id)
+        end
+        photo:applyDevelopSettings(settings)
+        applied = true
+    end)
+
+    Log.info(string.format("Set color adjustments on photo %s", args.photo_id))
+
+    return {
+        success = applied,
+        photo_id = args.photo_id,
+        applied_settings = settings,
     }
 end
 

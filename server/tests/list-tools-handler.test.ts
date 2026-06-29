@@ -19,11 +19,12 @@ const EXPECTED_TOOL_NAMES = [
   'apply_develop_preset',
   'copy_develop_settings',
   'set_develop_settings',
+  'set_color_adjustments',
 ] as const;
 
 describe('TOOL_DEFINITIONS', () => {
-  it('contains exactly 14 tools', () => {
-    expect(TOOL_DEFINITIONS).toHaveLength(14);
+  it('contains exactly 15 tools', () => {
+    expect(TOOL_DEFINITIONS).toHaveLength(15);
   });
 
   it('tool names are unique', () => {
@@ -84,6 +85,7 @@ describe('tool required fields', () => {
     ['apply_develop_preset', ['photo_ids', 'preset_name']],
     ['copy_develop_settings', ['source_id', 'target_ids']],
     ['set_develop_settings', ['photo_id', 'settings']],
+    ['set_color_adjustments', ['photo_id', 'adjustments']],
   ])('%s requires %j', (name, required) => {
     expect(toolRequired(name)).toEqual(required);
   });
@@ -163,6 +165,62 @@ describe('develop setting schema', () => {
 
   it('matches Lua develop setting allowlist', () => {
     expect(parseLuaDevelopSettingKeys()).toEqual(DEVELOP_SETTING_KEYS);
+  });
+});
+
+describe('color adjustment schema', () => {
+  it('defines strict HSL, color grading, and calibration groups', () => {
+    const tool = TOOL_DEFINITIONS.find((t) => t.name === 'set_color_adjustments');
+    expect(tool).toBeDefined();
+
+    const properties = tool?.inputSchema.properties as Record<string, {
+      additionalProperties?: boolean;
+      minProperties?: number;
+      properties?: Record<string, unknown>;
+    }>;
+    const adjustments = properties.adjustments as {
+      additionalProperties?: boolean;
+      minProperties?: number;
+      properties?: Record<string, { properties?: Record<string, unknown> }>;
+    };
+
+    expect(tool?.inputSchema.additionalProperties).toBe(false);
+    expect(adjustments.additionalProperties).toBe(false);
+    expect(adjustments.minProperties).toBe(1);
+    expect(Object.keys(adjustments.properties ?? {})).toEqual([
+      'hsl',
+      'color_grading',
+      'calibration',
+    ]);
+
+    const hsl = adjustments.properties?.hsl;
+    expect(Object.keys(hsl?.properties ?? {})).toEqual([
+      'Red',
+      'Orange',
+      'Yellow',
+      'Green',
+      'Aqua',
+      'Blue',
+      'Purple',
+      'Magenta',
+    ]);
+
+    const colorGrading = adjustments.properties?.color_grading;
+    expect(Object.keys(colorGrading?.properties ?? {})).toEqual([
+      'Shadow',
+      'Midtone',
+      'Highlight',
+      'Global',
+      'Blending',
+      'Balance',
+    ]);
+
+    const calibration = adjustments.properties?.calibration;
+    expect(Object.keys(calibration?.properties ?? {})).toEqual([
+      'Red',
+      'Green',
+      'Blue',
+    ]);
   });
 });
 

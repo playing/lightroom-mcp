@@ -126,6 +126,7 @@ local DISPATCH = {
     apply_develop_preset = HandlerDevelop.applyDevelopPreset,
     copy_develop_settings = HandlerDevelop.copyDevelopSettings,
     set_develop_settings = HandlerDevelop.setDevelopSettings,
+    set_color_adjustments = HandlerDevelop.setColorAdjustments,
 }
 
 -- Generous wait so the very first response after handshake doesn't get

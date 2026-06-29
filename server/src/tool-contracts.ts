@@ -88,6 +88,97 @@ const developSettingsProperties = Object.fromEntries(
   DEVELOP_SETTING_KEYS.map((key) => [key, developSettingValueSchema]),
 );
 
+const rangeNumber = (description: string, minimum: number, maximum: number) => ({
+  type: "number",
+  description,
+  minimum,
+  maximum,
+});
+
+const HSL_CHANNELS = [
+  "Red",
+  "Orange",
+  "Yellow",
+  "Green",
+  "Aqua",
+  "Blue",
+  "Purple",
+  "Magenta",
+] as const;
+
+const COLOR_GRADING_WHEELS = ["Shadow", "Midtone", "Highlight", "Global"] as const;
+const CALIBRATION_CHANNELS = ["Red", "Green", "Blue"] as const;
+
+const hslChannelSchema = {
+  type: "object",
+  additionalProperties: false,
+  minProperties: 1,
+  properties: {
+    Hue: rangeNumber("Hue adjustment (-100 to 100)", -100, 100),
+    Saturation: rangeNumber("Saturation adjustment (-100 to 100)", -100, 100),
+    Luminance: rangeNumber("Luminance adjustment (-100 to 100)", -100, 100),
+  },
+};
+
+const hslSchema = {
+  type: "object",
+  additionalProperties: false,
+  minProperties: 1,
+  properties: Object.fromEntries(HSL_CHANNELS.map((channel) => [channel, hslChannelSchema])),
+};
+
+const colorGradingWheelSchema = {
+  type: "object",
+  additionalProperties: false,
+  minProperties: 1,
+  properties: {
+    Hue: rangeNumber("Color grading hue (0 to 360)", 0, 360),
+    Sat: rangeNumber("Color grading saturation (0 to 100)", 0, 100),
+    Lum: rangeNumber("Color grading luminance (-100 to 100)", -100, 100),
+  },
+};
+
+const colorGradingSchema = {
+  type: "object",
+  additionalProperties: false,
+  minProperties: 1,
+  properties: {
+    ...Object.fromEntries(COLOR_GRADING_WHEELS.map((wheel) => [wheel, colorGradingWheelSchema])),
+    Blending: rangeNumber("Color grading blending (0 to 100)", 0, 100),
+    Balance: rangeNumber("Color grading balance (-100 to 100)", -100, 100),
+  },
+};
+
+const calibrationChannelSchema = {
+  type: "object",
+  additionalProperties: false,
+  minProperties: 1,
+  properties: {
+    Hue: rangeNumber("Calibration primary hue (-100 to 100)", -100, 100),
+    Saturation: rangeNumber("Calibration primary saturation (-100 to 100)", -100, 100),
+  },
+};
+
+const calibrationSchema = {
+  type: "object",
+  additionalProperties: false,
+  minProperties: 1,
+  properties: Object.fromEntries(
+    CALIBRATION_CHANNELS.map((channel) => [channel, calibrationChannelSchema]),
+  ),
+};
+
+const colorAdjustmentsSchema = {
+  type: "object",
+  additionalProperties: false,
+  minProperties: 1,
+  properties: {
+    hsl: hslSchema,
+    color_grading: colorGradingSchema,
+    calibration: calibrationSchema,
+  },
+};
+
 export const TOOL_CONTRACTS: ToolContract[] = [
   {
     name: "search_photos",
@@ -340,6 +431,24 @@ export const TOOL_CONTRACTS: ToolContract[] = [
         },
       },
       required: ["photo_id", "settings"],
+    },
+  },
+  {
+    name: "set_color_adjustments",
+    luaHandler: "HandlerDevelop.setColorAdjustments",
+    description:
+      "Set structured global color adjustments on a photo: HSL/Color Mixer, Color Grading, and Calibration. Use guarded virtual-copy workflows for production writes.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        photo_id: {
+          type: "string",
+          description: "Photo ID or file path",
+        },
+        adjustments: colorAdjustmentsSchema,
+      },
+      required: ["photo_id", "adjustments"],
     },
   },
 ];

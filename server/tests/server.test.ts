@@ -3,6 +3,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createMcpServer } from '../src/create-server.js';
 import type { PluginResponse } from '../src/dispatcher.js';
+import { TOOL_CONTRACTS } from '../src/tool-contracts.js';
 
 interface ToolResult {
   content: Array<{ type: string; text: string }>;
@@ -45,17 +46,18 @@ describe('createMcpServer', () => {
   });
 
   describe('ListTools', () => {
-    it('returns all 15 tools', async () => {
+    it('returns every tool contract', async () => {
       pair = await connect();
       const { tools } = await pair.client.listTools();
-      expect(tools).toHaveLength(15);
+      expect(tools).toHaveLength(TOOL_CONTRACTS.length);
     });
 
-    it('includes search_photos, set_develop_settings, and set_color_adjustments', async () => {
+    it('includes key workflow tools', async () => {
       pair = await connect();
       const { tools } = await pair.client.listTools();
       const names = tools.map((t) => t.name);
       expect(names).toContain('search_photos');
+      expect(names).toContain('create_virtual_copy');
       expect(names).toContain('set_develop_settings');
       expect(names).toContain('set_color_adjustments');
     });

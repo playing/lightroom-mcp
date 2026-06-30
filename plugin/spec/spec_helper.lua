@@ -48,7 +48,7 @@ end
 local VALID_METADATA_KEYS = {}
 for _, key in ipairs({
     -- File / catalog
-    "fileName", "fileSize", "fileFormat", "path", "dimensions",
+    "fileName", "fileSize", "fileFormat", "path", "dimensions", "copyName",
     "rating", "colorNameForLabel", "pickStatus", "keywords",
     -- EXIF
     "dateTimeOriginal", "dateTimeDigitized", "cameraMake", "cameraModel",

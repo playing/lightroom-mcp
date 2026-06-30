@@ -232,6 +232,20 @@ export const TOOL_CONTRACTS: ToolContract[] = [
     },
   },
   {
+    name: "create_virtual_copy",
+    luaHandler: "HandlerVirtualCopies.createVirtualCopy",
+    description: "Create one Lightroom virtual copy from a source photo and return the new copy identity.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        photo_id: { type: "string", description: "Source photo ID or file path" },
+        copy_name: { type: "string", description: "Optional Lightroom copy name" },
+      },
+      required: ["photo_id"],
+    },
+  },
+  {
     name: "list_collections",
     luaHandler: "HandlerCollections.listCollections",
     description: "List all collections in Lightroom catalog (paginated, default limit 100)",

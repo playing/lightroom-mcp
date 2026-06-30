@@ -17,6 +17,7 @@ local HandlerImport = require 'HandlerImport'
 local HandlerExport = require 'HandlerExport'
 local HandlerSelection = require 'HandlerSelection'
 local HandlerDevelop = require 'HandlerDevelop'
+local HandlerVirtualCopies = require 'HandlerVirtualCopies'
 local Log = require 'Log'
 
 local DEFAULT_REQUEST_PORT = 58763
@@ -117,6 +118,7 @@ local DISPATCH = {
     create_collection = HandlerCollections.createCollection,
     add_to_collection = HandlerCollections.addToCollection,
     get_photo_metadata = HandlerMetadata.getPhotoMetadata,
+    create_virtual_copy = HandlerVirtualCopies.createVirtualCopy,
     set_keywords = HandlerOrganization.setKeywords,
     set_rating = HandlerOrganization.setRating,
     import_photos = HandlerImport.importPhotos,

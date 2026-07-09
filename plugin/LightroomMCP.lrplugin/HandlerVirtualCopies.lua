@@ -23,13 +23,36 @@ local function safeMetadata(photo, kind, key)
     return nil
 end
 
+local function photoId(photo)
+    local ok, value = pcall(function() return photo.localIdentifier end)
+    if ok and value ~= nil then
+        return tostring(value)
+    end
+    return nil
+end
+
+local function sameSourceFile(source, created)
+    local sourcePath = safeMetadata(source, "raw", "path")
+    local createdPath = safeMetadata(created, "raw", "path")
+    return sourcePath ~= nil and createdPath ~= nil and sourcePath == createdPath
+end
+
+local function samePhoto(a, b)
+    if a == b then
+        return true
+    end
+    local aId = photoId(a)
+    local bId = photoId(b)
+    return aId ~= nil and bId ~= nil and aId == bId
+end
+
 local function selectedPhotoOthers(selectedPhotos, activePhoto)
     local others = {}
     if type(selectedPhotos) ~= "table" then
         return others
     end
     for _, photo in ipairs(selectedPhotos) do
-        if photo ~= activePhoto then
+        if not samePhoto(photo, activePhoto) then
             table.insert(others, photo)
         end
     end
@@ -52,21 +75,9 @@ local function captureActiveSources(catalog)
     if type(catalog.getActiveSources) ~= "function" then
         return nil
     end
-    local ok, value = pcall(function() return catalog:getActiveSources() end)
+    local ok, value = LrTasks.pcall(function() return catalog:getActiveSources() end)
     if ok then return value end
     return nil
-end
-
-local function selectAllPhotographsSource(catalog, warnings)
-    if type(catalog.setActiveSources) ~= "function" or not catalog.kAllPhotos then
-        return
-    end
-    local ok, err = LrTasks.pcall(function()
-        catalog:setActiveSources(catalog.kAllPhotos)
-    end)
-    if not ok then
-        table.insert(warnings, "active_source_not_set: " .. tostring(err))
-    end
 end
 
 local function restoreActiveSources(catalog, activeSources, warnings)
@@ -81,39 +92,147 @@ local function restoreActiveSources(catalog, activeSources, warnings)
     end
 end
 
-local function createCopyWithAvailableApi(catalog, source, copyName, warnings)
-    if type(catalog.createVirtualCopies) == "function"
-        and type(catalog.setSelectedPhotos) == "function" then
-        local previousActive = nil
-        local previousSelection = nil
-        local previousActiveSources = captureActiveSources(catalog)
-        if type(catalog.getTargetPhoto) == "function" then
-            local ok, value = LrTasks.pcall(function() return catalog:getTargetPhoto() end)
-            if ok then previousActive = value end
-        end
-        if type(catalog.getTargetPhotos) == "function" then
-            local ok, value = LrTasks.pcall(function() return catalog:getTargetPhotos() end)
-            if ok then previousSelection = value end
-        end
+local function selectAllPhotographsSource(catalog, warnings)
+    if type(catalog.setActiveSources) ~= "function" or not catalog.kAllPhotos then
+        table.insert(warnings, "active_source_not_set: setActiveSources unavailable")
+        return false
+    end
+    local ok, result = LrTasks.pcall(function()
+        return catalog:setActiveSources(catalog.kAllPhotos)
+    end)
+    if not ok then
+        table.insert(warnings, "active_source_not_set: " .. tostring(result))
+        return false
+    end
+    if result == false then
+        table.insert(warnings, "active_source_not_set: Lightroom returned false")
+        return false
+    end
+    return true
+end
 
-        selectAllPhotographsSource(catalog, warnings)
-        catalog:setSelectedPhotos(source, {})
-        local ok, copiesOrErr = LrTasks.pcall(function()
-            return catalog:createVirtualCopies()
+local function getTargetPhoto(catalog, warnings, label)
+    if type(catalog.getTargetPhoto) ~= "function" then
+        table.insert(warnings, label .. "_unavailable")
+        return nil
+    end
+    local ok, value = LrTasks.pcall(function() return catalog:getTargetPhoto() end)
+    if ok then return value end
+    table.insert(warnings, label .. "_failed: " .. tostring(value))
+    return nil
+end
+
+local function validCreatedPhoto(source, candidate, warnings, label)
+    if samePhoto(source, candidate) then
+        table.insert(warnings, label .. "_returned_source_photo")
+        return nil
+    end
+    if photoId(candidate) and sameSourceFile(source, candidate) then
+        return candidate
+    end
+    table.insert(warnings, label .. "_returned_non_matching_photo")
+    return nil
+end
+
+local function tryCreate(warnings, label, fn)
+    local ok, result = LrTasks.pcall(fn)
+    if ok then
+        return result
+    end
+    table.insert(warnings, label .. "_failed: " .. tostring(result))
+    return nil
+end
+
+local function createCopyFromVerifiedSelection(catalog, source, copyName, warnings)
+    if type(catalog.createVirtualCopies) ~= "function"
+        or type(catalog.setSelectedPhotos) ~= "function" then
+        return nil
+    end
+
+    local previousActive = getTargetPhoto(catalog, warnings, "previous_target_photo")
+    local previousSelection = nil
+    local previousActiveSources = captureActiveSources(catalog)
+    if type(catalog.getTargetPhotos) == "function" then
+        local ok, value = LrTasks.pcall(function() return catalog:getTargetPhotos() end)
+        if ok then
+            previousSelection = value
+        else
+            table.insert(warnings, "previous_target_photos_failed: " .. tostring(value))
+        end
+    end
+
+    local sourceReady = selectAllPhotographsSource(catalog, warnings)
+    local selected = false
+    if sourceReady then
+        local ok, err = LrTasks.pcall(function()
+            catalog:setSelectedPhotos(source, {})
         end)
+        if ok then
+            selected = true
+            if type(LrTasks.sleep) == "function" then
+                LrTasks.sleep(0.2)
+            end
+        else
+            table.insert(warnings, "source_selection_failed: " .. tostring(err))
+        end
+    end
+
+    local selectedSource = nil
+    if selected then
+        selectedSource = getTargetPhoto(catalog, warnings, "selected_target_photo")
+    end
+    if not samePhoto(source, selectedSource) then
+        table.insert(warnings, "selected_photo_not_changed: expected "
+            .. tostring(photoId(source)) .. " got " .. tostring(photoId(selectedSource)))
         restoreSelection(catalog, previousActive, previousSelection, warnings)
         restoreActiveSources(catalog, previousActiveSources, warnings)
-        if not ok then
-            error(copiesOrErr)
-        end
-        if type(copiesOrErr) == "table" then
-            return copiesOrErr[1]
+        return nil
+    end
+
+    local copies = tryCreate(warnings, "selected_create_virtual_copies", function()
+        return catalog:createVirtualCopies(copyName)
+    end)
+    restoreSelection(catalog, previousActive, previousSelection, warnings)
+    restoreActiveSources(catalog, previousActiveSources, warnings)
+
+    if type(copies) ~= "table" then
+        table.insert(warnings, "selected_create_virtual_copies_returned_non_table")
+        return nil
+    end
+    return validCreatedPhoto(source, copies[1], warnings, "selected_create_virtual_copies")
+end
+
+local function unavailableError(warnings)
+    if #warnings > 0 then
+        error("Lightroom SDK virtual copy creation API unavailable: " .. table.concat(warnings, " | "))
+    end
+    error("Lightroom SDK virtual copy creation API unavailable")
+end
+
+local function createCopyWithAvailableApi(catalog, source, copyName, warnings)
+    if type(catalog.createVirtualCopy) == "function" then
+        local created = tryCreate(warnings, "catalog_create_virtual_copy", function()
+            return catalog:createVirtualCopy(source)
+        end)
+        if created then
+            local valid = validCreatedPhoto(source, created, warnings, "catalog_create_virtual_copy")
+            if valid then return valid end
         end
     end
     if type(source.createVirtualCopy) == "function" then
-        return source:createVirtualCopy()
+        local created = tryCreate(warnings, "source_create_virtual_copy", function()
+            return source:createVirtualCopy()
+        end)
+        if created then
+            local valid = validCreatedPhoto(source, created, warnings, "source_create_virtual_copy")
+            if valid then return valid end
+        end
     end
-    error("Lightroom SDK virtual copy creation API unavailable")
+    local selectedCopy = createCopyFromVerifiedSelection(catalog, source, copyName, warnings)
+    if selectedCopy then
+        return selectedCopy
+    end
+    unavailableError(warnings)
 end
 
 local function setCopyNameIfRequested(catalog, created, copyName, warnings)

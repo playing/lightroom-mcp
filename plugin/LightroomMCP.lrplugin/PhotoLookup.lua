@@ -13,12 +13,16 @@ end
 function PhotoLookup.resolveMany(catalog, photoIds)
     local results = {}
     local wantedLocalIds = {}
-    local candidatePathIndexes = {}
+    local wantedPaths = {}
+    local remainingPaths = 0
 
     for i, id in ipairs(photoIds) do
         results[i] = { id = id, photo = nil }
         if looksLikePath(id) then
-            table.insert(candidatePathIndexes, i)
+            local key = tostring(id)
+            if wantedPaths[key] == nil then wantedPaths[key] = {} end
+            table.insert(wantedPaths[key], i)
+            remainingPaths = remainingPaths + 1
         else
             local key = tostring(id)
             if wantedLocalIds[key] == nil then wantedLocalIds[key] = {} end
@@ -26,8 +30,8 @@ function PhotoLookup.resolveMany(catalog, photoIds)
         end
     end
 
-    -- LrCatalog has no findPhotoByLocalIdentifier, so local-id lookup still
-    -- needs one catalog pass. Keep this pass cheap by avoiding getRawMetadata.
+    -- LrCatalog has no findPhotoByLocalIdentifier, so resolution needs one
+    -- catalog pass. Path metadata remains untouched for numeric-only batches.
     for _, p in ipairs(catalog:getAllPhotos()) do
         local lid = p.localIdentifier
         if lid ~= nil then
@@ -38,32 +42,15 @@ function PhotoLookup.resolveMany(catalog, photoIds)
                 end
             end
         end
-    end
-
-    if #candidatePathIndexes > 0 then
-        local wantedPaths = {}
-        local remaining = 0
-        for _, idx in ipairs(candidatePathIndexes) do
-            if results[idx].photo == nil then
-                local key = tostring(results[idx].id)
-                if wantedPaths[key] == nil then wantedPaths[key] = {} end
-                table.insert(wantedPaths[key], idx)
-                remaining = remaining + 1
-            end
-        end
-
-        if remaining > 0 then
-            for _, p in ipairs(catalog:getAllPhotos()) do
-                local photoPath = p:getRawMetadata('path')
-                local indexes = wantedPaths[photoPath]
-                if indexes then
-                    for _, idx in ipairs(indexes) do
-                        results[idx].photo = p
-                        remaining = remaining - 1
-                    end
-                    wantedPaths[photoPath] = nil
-                    if remaining <= 0 then break end
+        if remainingPaths > 0 then
+            local photoPath = p:getRawMetadata('path')
+            local indexes = wantedPaths[photoPath]
+            if indexes then
+                for _, idx in ipairs(indexes) do
+                    results[idx].photo = p
+                    remainingPaths = remainingPaths - 1
                 end
+                wantedPaths[photoPath] = nil
             end
         end
     end

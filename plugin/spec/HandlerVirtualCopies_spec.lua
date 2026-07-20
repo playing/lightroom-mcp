@@ -1,5 +1,11 @@
 local helper = require 'spec_helper'
 
+local function assertErrorContains(fn, expected)
+    local ok, err = pcall(fn)
+    assert.is_false(ok)
+    assert.is_truthy(string.find(tostring(err), expected, 1, true))
+end
+
 local function setup(opts)
     opts = opts or {}
     local catalog = helper.fakeCatalog(opts)
@@ -167,7 +173,7 @@ describe("HandlerVirtualCopies.createVirtualCopy", function()
             error("createVirtualCopies should not be called")
         end
 
-        assert.has_error(function()
+        assertErrorContains(function()
             Handler.createVirtualCopy({ photo_id = "100" })
         end, "selected_photo_not_changed")
     end)
@@ -188,7 +194,7 @@ describe("HandlerVirtualCopies.createVirtualCopy", function()
             return wrongCopy
         end
 
-        assert.has_error(function()
+        assertErrorContains(function()
             Handler.createVirtualCopy({ photo_id = "100" })
         end, "Lightroom SDK virtual copy creation API unavailable")
     end)
@@ -204,7 +210,7 @@ describe("HandlerVirtualCopies.createVirtualCopy", function()
             return source
         end
 
-        assert.has_error(function()
+        assertErrorContains(function()
             Handler.createVirtualCopy({ photo_id = "100" })
         end, "Lightroom SDK virtual copy creation API unavailable")
     end)
@@ -223,7 +229,7 @@ describe("HandlerVirtualCopies.createVirtualCopy", function()
             return copy
         end
 
-        assert.has_error(function()
+        assertErrorContains(function()
             Handler.createVirtualCopy({ photo_id = "100" })
         end, "Lightroom SDK virtual copy creation API unavailable")
     end)

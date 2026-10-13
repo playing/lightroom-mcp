@@ -145,7 +145,8 @@ end
 
 local function createCopyFromVerifiedSelection(catalog, source, copyName, warnings)
     if type(catalog.createVirtualCopies) ~= "function"
-        or type(catalog.setSelectedPhotos) ~= "function" then
+        or type(catalog.setSelectedPhotos) ~= "function"
+        or type(catalog.getTargetPhotos) ~= "function" then
         return nil
     end
 
@@ -159,6 +160,11 @@ local function createCopyFromVerifiedSelection(catalog, source, copyName, warnin
         else
             table.insert(warnings, "previous_target_photos_failed: " .. tostring(value))
         end
+    end
+
+    -- Without a full previous selection we cannot safely restore the view.
+    if type(previousSelection) ~= "table" then
+        return nil
     end
 
     local sourceReady = selectAllPhotographsSource(catalog, warnings)
@@ -184,6 +190,21 @@ local function createCopyFromVerifiedSelection(catalog, source, copyName, warnin
     if not samePhoto(source, selectedSource) then
         table.insert(warnings, "selected_photo_not_changed: expected "
             .. tostring(photoId(source)) .. " got " .. tostring(photoId(selectedSource)))
+        restoreSelection(catalog, previousActive, previousSelection, warnings)
+        restoreActiveSources(catalog, previousActiveSources, warnings)
+        return nil
+    end
+
+    -- The active photo can change while other selected photos remain selected.
+    -- createVirtualCopies acts on the complete selection, so checking only the
+    -- active photo can accidentally duplicate an entire batch.
+    local selectionOk, selectedPhotos = LrTasks.pcall(function()
+        return catalog:getTargetPhotos()
+    end)
+    if not selectionOk or type(selectedPhotos) ~= "table"
+        or #selectedPhotos ~= 1 or not samePhoto(source, selectedPhotos[1]) then
+        table.insert(warnings, "selected_photo_set_not_isolated: expected only "
+            .. tostring(photoId(source)))
         restoreSelection(catalog, previousActive, previousSelection, warnings)
         restoreActiveSources(catalog, previousActiveSources, warnings)
         return nil

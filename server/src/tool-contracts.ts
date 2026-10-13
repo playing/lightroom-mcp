@@ -426,6 +426,28 @@ export const TOOL_CONTRACTS: ToolContract[] = [
     },
   },
   {
+    name: "set_metadata",
+    luaHandler: "HandlerMetadata.setMetadata",
+    description:
+      "Set IPTC description and rights fields of photos (title, caption, headline, creator, copyright notice, rights usage terms, copyright info URL, creator website), as get_photo_metadata reports them. Fields left out are unchanged; an empty string clears a field. Give at least one field. Copyright status cannot be set.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        photo_ids: photoIdArray("Array of photo IDs or file paths"),
+        title: { type: "string", description: "Title" },
+        caption: { type: "string", description: "Caption (IPTC description)" },
+        headline: { type: "string", description: "Headline" },
+        creator: { type: "string", description: "Creator (photographer)" },
+        copyright: { type: "string", description: "Copyright notice, e.g. '© 2026 Jane Doe'" },
+        rights_usage_terms: { type: "string", description: "Rights usage terms" },
+        copyright_info_url: { type: "string", description: "Copyright info URL, e.g. a licensing page" },
+        creator_url: { type: "string", description: "Creator's website (IPTC creator contact info)" },
+      },
+      required: ["photo_ids"],
+    },
+  },
+  {
     name: "list_collections",
     luaHandler: "HandlerCollections.listCollections",
     description: "List all collections in Lightroom catalog (paginated, default limit 100)",
@@ -464,6 +486,35 @@ export const TOOL_CONTRACTS: ToolContract[] = [
         photo_ids: photoIdArray("Array of photo IDs or file paths"),
       },
       required: ["collection_name", "photo_ids"],
+    },
+  },
+  {
+    name: "remove_from_collection",
+    luaHandler: "HandlerCollections.removeFromCollection",
+    description:
+      "Remove photos from a collection. They stay in the catalog and in any other collection. Smart collections cannot be edited this way. removed counts unique photos that were in the collection. Use a path from list_collections when names repeat.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        collection_name: { type: "string", description: "Collection name or path from list_collections" },
+        photo_ids: photoIdArray("Array of photo IDs or file paths"),
+      },
+      required: ["collection_name", "photo_ids"],
+    },
+  },
+  {
+    name: "delete_collection",
+    luaHandler: "HandlerCollections.deleteCollection",
+    description:
+      "Delete a collection. Its photos stay in the catalog. Use a path from list_collections when names repeat; an ambiguous bare name is rejected.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        collection_name: { type: "string", description: "Collection name or path from list_collections" },
+      },
+      required: ["collection_name"],
     },
   },
   {
@@ -519,6 +570,29 @@ export const TOOL_CONTRACTS: ToolContract[] = [
         limit: { type: "number", description: "Max keywords to return (default 100)", minimum: 0 },
         offset: { type: "number", description: "Number of keywords to skip (default 0)", minimum: 0 },
       },
+    },
+  },
+  {
+    name: "rename_keyword",
+    luaHandler: "HandlerKeywords.renameKeyword",
+    description:
+      "Rename a keyword in place: every photo tagged with it shows the new name, and its parent, children and synonyms are unchanged. keyword is a plain name, which must match exactly one keyword, or a 'Parent|Child' path (see list_keywords). Fails if a sibling already has the new name, ignoring case, since keywords cannot be merged; a change of case alone is allowed.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        keyword: {
+          type: "string",
+          minLength: 1,
+          description: "Keyword to rename: a plain name or a 'Parent|Child' path",
+        },
+        new_name: {
+          type: "string",
+          minLength: 1,
+          description: "New name for that keyword (a single name, not a path)",
+        },
+      },
+      required: ["keyword", "new_name"],
     },
   },
   {

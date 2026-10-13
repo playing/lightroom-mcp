@@ -178,6 +178,46 @@ describe("HandlerVirtualCopies.createVirtualCopy", function()
         end, "selected_photo_not_changed")
     end)
 
+    for _, scenario in ipairs({ "multiple", "empty", "wrong", "unreadable" }) do
+        it("does not create with an unisolated selection: " .. scenario, function()
+            local source = helper.fakePhoto({ id = "100", path = "C:/photos/source.ARW" })
+            local previous = helper.fakePhoto({ id = "200", path = "C:/photos/previous.ARW" })
+            local active = previous
+            local selection = { previous }
+            local sources = { "previous-source" }
+            local catalog, Handler = setup({ photos = { source, previous } })
+            catalog.kAllPhotos = "all-photos"
+            catalog.getActiveSources = function() return sources end
+            catalog.setActiveSources = function(_, value) sources = value return true end
+            catalog.getTargetPhoto = function() return active end
+            catalog.getTargetPhotos = function()
+                if active == source and scenario == "unreadable" then error("read failed") end
+                return selection
+            end
+            catalog.setSelectedPhotos = function(_, value, others)
+                active = value
+                if value == source then
+                    if scenario == "multiple" then selection = { source, previous }
+                    elseif scenario == "wrong" then selection = { previous }
+                    else selection = {} end
+                else
+                    selection = { value }
+                    for _, photo in ipairs(others) do table.insert(selection, photo) end
+                end
+            end
+            local created = false
+            catalog.createVirtualCopies = function() created = true return {} end
+
+            assertErrorContains(function()
+                Handler.createVirtualCopy({ photo_id = "100" })
+            end, "selected_photo_set_not_isolated")
+            assert.is_false(created)
+            assert.are.equal(previous, active)
+            assert.are.same({ previous }, selection)
+            assert.are.same({ "previous-source" }, sources)
+        end)
+    end
+
     it("rejects a created photo that does not match the source file", function()
         local source = helper.fakePhoto({
             id = "100",

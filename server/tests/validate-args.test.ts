@@ -74,6 +74,28 @@ describe('validateToolArgs', () => {
     expect(validateToolArgs('get_photo_preview', { photo_id: 914, size: '1024' })).toContain('size');
   });
 
+  it('accepts metadata strings and rejects other types or unknown fields', () => {
+    const base = { photo_ids: [914] };
+
+    expect(validateToolArgs('set_metadata', { ...base, title: 'Dunluce Castle', caption: '' })).toBeNull();
+    expect(validateToolArgs('set_metadata', { ...base, copyright_info_url: 'https://example.com', creator_url: '' })).toBeNull();
+    expect(validateToolArgs('set_metadata', { ...base, copyright_status: 'copyrighted' })).toContain('copyright_status');
+    expect(validateToolArgs('set_metadata', { ...base, title: 7 })).toContain('title');
+    expect(validateToolArgs('set_metadata', { ...base, artist: 'Jane' })).toContain('artist');
+  });
+
+  it('requires a non-empty keyword and new name to rename', () => {
+    expect(validateToolArgs('rename_keyword', { keyword: 'Places|KC', new_name: 'Kansas City' })).toBeNull();
+    expect(validateToolArgs('rename_keyword', { keyword: 'person' })).toContain("required property 'new_name'");
+    expect(validateToolArgs('rename_keyword', { keyword: '', new_name: 'x' })).toContain('keyword');
+  });
+
+  it('requires a collection name to delete and nothing else', () => {
+    expect(validateToolArgs('delete_collection', { collection_name: 'Temp' })).toBeNull();
+    expect(validateToolArgs('delete_collection', {})).toContain("required property 'collection_name'");
+    expect(validateToolArgs('delete_collection', { collection_name: 'Temp', photo_ids: [914] })).toContain('photo_ids');
+  });
+
   it('reports a missing required field', () => {
     const msg = validateToolArgs('set_rating', { photo_ids: [914] });
 

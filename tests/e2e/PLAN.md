@@ -83,13 +83,15 @@ node tests/e2e/mcp-runner.mjs read
 
 **What it covers**
 
-- `tools/list` returns 14 tools (matches `server/src/index.ts`)
+- `tools/list` returns 24 tools (matches `server/src/tool-contracts.ts`)
 - `list_collections` — paginated, count + array shape
 - `get_selected_photos` — paginated, array shape (works whether something is selected or not; falls back to filmstrip)
 - `search_photos` no-filter — returns first N photos
 - `search_photos` with `rating: 5` — exercises the searchDesc builder
 - `get_photo_metadata` by `localIdentifier` AND by file path — both lookup paths
 - `list_develop_presets` — exercises preset folder iteration
+- `get_develop_preset` — reads one exact preset by UUID (or disambiguated name)
+- `compare_develop_presets` — compares the first two presets when available
 
 **Pass criteria** — all `OK`, summary line shows `0 failed`.
 
@@ -105,16 +107,29 @@ Goal: `get_selected_photos` actually reflects the filmstrip selection.
 
 **Steps**
 
-1. In Lightroom, navigate to a folder, **select 3 photos** in the filmstrip (Shift-click or Cmd-click)
-2. Run:
+1. Pick three ids: `node tests/e2e/mcp-runner.mjs tool search_photos '{"limit":3}'`
+2. Stage the selection without touching Lightroom:
+   ```sh
+   node manual-test.mjs set_selection '{"photo_ids":[<id0>,<id1>,<id2>]}'
+   ```
+   `set_selection` is a **test-only** plugin action — it has no MCP tool contract,
+   so it is reachable from `manual-test.mjs` only, never from an MCP client. It
+   returns `{ selected, active, missing }`; `active` is the first id, which
+   becomes Lightroom's active photo.
+3. Run:
    ```sh
    node tests/e2e/mcp-runner.mjs tool get_selected_photos '{"limit":10}'
    ```
+
+Selecting by hand (Shift-click / Cmd-click in the filmstrip) still works and is
+worth doing once, to confirm the plugin reads the *user's* selection and not just
+its own.
 
 **Pass criteria**
 
 - `count: 3`, `photos: [...]` array length 3
 - The `filename` and `path` fields match what's selected
+- Lightroom's filmstrip status bar reads `… / 3 selected / <active filename>`
 
 **Edge: deselect everything** — repeat. `getTargetPhotos()` falls back to the entire filmstrip / folder; expect `count` to equal the visible photo count, not 0.
 
@@ -173,6 +188,34 @@ node tests/e2e/mcp-runner.mjs develop
 
 - Develop module on the test photo → Exposure briefly shows +0.50, then 0.00
 - After preset applied, History panel shows the preset name
+
+### Preset checkpoint/export spot check
+
+This creates a persistent plugin-managed checkpoint, so use a disposable name and a representative test photo:
+
+```sh
+LIGHTROOM_MCP_E2E_PRESET_DIR="<output-root>" node tests/e2e/mcp-runner.mjs preset-roundtrip
+```
+
+The scripted round trip finds one source photo without modifying it, captures one supported setting, reads the exact checkpoint back, exports its Lightroom-generated backing file, and verifies that a repeated export is refused without changing the first file.
+
+For a manually selected representative photo and a wider setting set:
+
+```sh
+node tests/e2e/mcp-runner.mjs tool create_develop_preset \
+  '{"photo_id":"<id>","preset_name":"MCP_E2E_Look_v1","settings":["Contrast2012","Vibrance","ToneCurvePV2012"]}'
+node tests/e2e/mcp-runner.mjs tool get_develop_preset \
+  '{"preset_name":"MCP_E2E_Look_v1","preset_scope":"plugin"}'
+node tests/e2e/mcp-runner.mjs tool export_develop_preset \
+  '{"preset_name":"MCP_E2E_Look_v1","preset_scope":"plugin","destination_dir":"<empty-folder>","filename":"MCP_E2E_Look_v1"}'
+```
+
+**Pass criteria**
+
+- Create returns `scope: "plugin"` and `visible_in_develop: false`.
+- Get returns only the explicitly captured settings.
+- Export creates one preset file and a repeated export to the same path is refused.
+- Import the exported file through Lightroom's Presets panel before claiming Lightroom import compatibility.
 
 ---
 

@@ -16,9 +16,16 @@ if not package.path:find(pluginRoot, 1, true) then
 end
 
 -- Install a mock `import` global. Subsequent `import 'X'` calls return the mock for X.
+-- Pure helper namespaces every spec gets unless it installs its own. lower is
+-- ASCII-only here; Lightroom's folds Unicode.
+local defaultImports = {
+    LrStringUtils = { lower = string.lower },
+}
+
 function M.installImport(modules)
     _G.import = function(name)
         local m = modules[name]
+        if m == nil then m = defaultImports[name] end
         if m == nil then
             error("No mock installed for import('" .. tostring(name) .. "')", 2)
         end
@@ -50,6 +57,7 @@ for _, key in ipairs({
     -- File / catalog
     "fileName", "fileSize", "fileFormat", "path", "dimensions", "copyName",
     "rating", "colorNameForLabel", "pickStatus", "keywords",
+    "uuid", "isVirtualCopy", "croppedDimensions", "dateTimeOriginalISO8601",
     -- EXIF
     "dateTimeOriginal", "dateTimeDigitized", "cameraMake", "cameraModel",
     "cameraSerialNumber", "lens", "isoSpeedRating", "focalLength",
@@ -92,13 +100,40 @@ function M.fakePhoto(meta)
             table.insert(meta.__removedKeywords, kw)
         end,
         setRawMetadata = function(_, key, value) meta[key] = value end,
-        applyDevelopPreset = function(_, preset)
+        applyDevelopPreset = function(_, preset, plugin)
             meta.__appliedPreset = preset
+            meta.__appliedPresetPlugin = plugin
         end,
         applyDevelopSettings = function(_, settings)
             meta.__appliedSettings = settings
         end,
     }
+end
+
+-- Build a fake keyword. opts: parent (fake keyword), synonyms, includeOnExport.
+-- Registers itself with its parent so getChildren() sees it, as a keyword that
+-- already exists in the catalog would be.
+function M.fakeKeyword(name, opts)
+    opts = opts or {}
+    local children = {}
+    local kw = {
+        getName = function() return name end,
+        getParent = function() return opts.parent end,
+        getChildren = function() return children end,
+        getSynonyms = function() return opts.synonyms or {} end,
+        getAttributes = function()
+            return {
+                keywordName = name,
+                synonyms = opts.synonyms or {},
+                includeOnExport = opts.includeOnExport ~= false,
+            }
+        end,
+        __addChild = function(_, child) table.insert(children, child) end,
+    }
+    if opts.parent and not opts.detached then
+        opts.parent:__addChild(kw)
+    end
+    return kw
 end
 
 -- Build a fake collection.
@@ -123,6 +158,7 @@ end
 --   photos: array of fake photos
 --   collections: array of fake collections
 --   collectionSets: array of fake collection sets
+--   keywords: array of top-level fake keywords
 function M.fakeCatalog(opts)
     opts = opts or {}
     local photos = opts.photos or {}
@@ -130,6 +166,8 @@ function M.fakeCatalog(opts)
     local collectionSets = opts.collectionSets or {}
     local createdCollections = {}
     local createdKeywords = {}
+    local topKeywords = opts.keywords or {}
+    local pendingKeywords = {}
     local readAccessCount = 0
     local writeAccessCount = 0
     -- Tracks whether a catalog query (getTargetPhotos/findPhotos/getAllPhotos)
@@ -138,8 +176,20 @@ function M.fakeCatalog(opts)
     -- OUTSIDE the gate; specs assert getQueriedInsideReadAccess() == false.
     local insideReadAccess = false
     local queriedInsideReadAccess = false
+    -- Same nesting, write side. withWriteAccessDo is an EXCLUSIVE gate, so a
+    -- full-catalog scan held inside it serializes every other handler behind a
+    -- scan that writes nothing. Handlers must resolve their photos BEFORE
+    -- opening the gate; specs assert getQueriedInsideWriteAccess() == false.
+    local insideWriteAccess = false
+    local queriedInsideWriteAccess = false
+    local selectionCall = nil
+    -- How MANY catalog scans ran, not just where. A handler that can reject bad
+    -- input before scanning should prove it never scanned.
+    local queryCount = 0
     local function markQuery()
+        queryCount = queryCount + 1
         if insideReadAccess then queriedInsideReadAccess = true end
+        if insideWriteAccess then queriedInsideWriteAccess = true end
     end
 
     local function photoMatches(photo, criterion)
@@ -204,10 +254,32 @@ function M.fakeCatalog(opts)
             if not ok then error(err, 0) end
         end,
         getQueriedInsideReadAccess = function() return queriedInsideReadAccess end,
+        setSelectedPhotos = function(_, activePhoto, selected)
+            markQuery()
+            selectionCall = { active = activePhoto, photos = selected }
+        end,
+        getSelectionCall = function() return selectionCall end,
         withWriteAccessDo = function(_, _, fn)
             writeAccessCount = writeAccessCount + 1
-            fn()
+            insideWriteAccess = true
+            pendingKeywords = {}
+            local ok, err = pcall(fn)
+            insideWriteAccess = false
+            -- Keywords created in the transaction become visible once it
+            -- commits; a failed transaction leaves none behind.
+            local pending = pendingKeywords
+            pendingKeywords = {}
+            if not ok then error(err, 0) end
+            for _, kw in ipairs(pending) do
+                createdKeywords[#createdKeywords + 1] = kw
+                if kw:getParent() then
+                    kw:getParent():__addChild(kw)
+                else
+                    table.insert(topKeywords, kw)
+                end
+            end
         end,
+        getQueriedInsideWriteAccess = function() return queriedInsideWriteAccess end,
         findPhotoByLocalIdentifier = function(_, id)
             local target = tostring(id)
             for _, p in ipairs(photos) do
@@ -221,9 +293,37 @@ function M.fakeCatalog(opts)
             table.insert(collections, c)
             return c
         end,
-        createKeyword = function(_, name)
-            local kw = { getName = function() return name end }
-            table.insert(createdKeywords, kw)
+        getKeywords = function() return topKeywords end,
+        -- Models the SDK behaviour the handlers have to work around: a keyword
+        -- created in a write transaction is invisible to getKeywords() and
+        -- getChildren() until it commits, cannot be used as a parent before
+        -- then, and creating the same name twice in one transaction asserts.
+        -- returnExisting matches committed keywords ignoring case.
+        createKeyword = function(_, name, synonyms, includeOnExport, parent, returnExisting)
+            if not insideWriteAccess then
+                error("createKeyword outside withWriteAccessDo")
+            end
+            for _, kw in ipairs(pendingKeywords) do
+                if kw == parent then
+                    error("bad argument #2 to 'format' (number expected, got string)")
+                end
+                if kw:getParent() == parent and kw:getName():lower() == name:lower() then
+                    error("createKeyword: " .. name .. " already created in this transaction")
+                end
+            end
+            if returnExisting then
+                local siblings = parent and parent:getChildren() or topKeywords
+                for _, kw in ipairs(siblings) do
+                    if kw:getName():lower() == name:lower() then return kw end
+                end
+            end
+            local kw = M.fakeKeyword(name, {
+                parent = parent,
+                synonyms = synonyms,
+                includeOnExport = includeOnExport,
+                detached = true,
+            })
+            table.insert(pendingKeywords, kw)
             return kw
         end,
         addPhoto = function(_, path)
@@ -235,6 +335,7 @@ function M.fakeCatalog(opts)
         getCreatedKeywords = function() return createdKeywords end,
         getReadAccessCount = function() return readAccessCount end,
         getWriteAccessCount = function() return writeAccessCount end,
+        getQueryCount = function() return queryCount end,
     }
 end
 

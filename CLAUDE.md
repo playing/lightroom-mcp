@@ -16,6 +16,7 @@ Plugin opens **two LrSocket binds** as servers; MCP server connects to both.
 - Plugin :58764 (default) in `mode='send'` — server reads line-delimited JSON responses
 - Frame: `\n` terminator on every message (LrSocket buffers until newline)
 - Plugin allows **one client per port at a time**. MCP server holds a persistent connection.
+- Hosts spawn several bridges at once (Claude Desktop: chat + Cowork/Code shared pool, #238). `Bridge` (`server/src/bridge.ts`) elects one per port pair via the instance lock: the leader owns the plugin sockets and serves tool calls over local IPC (`broker.ts`: Unix socket in `~/.config/lightroom-mcp/`, named pipe on Windows, plugin token checked); followers forward, and re-elect when the leader exits. Never `process.exit` on lock contention.
 - `LrSocket.bind` in `mode='receive'` has a 10s no-client timeout that fires `onError`. Plugin auto-calls `:reconnect()` from a monitor loop in response. Reconnect storms are prevented by setting flags in callbacks and acting on them in the loop (never `:reconnect()` synchronously from `onError`).
 - `onMessage` runs in non-yielding context — handler dispatch must be wrapped in `LrTasks.startAsyncTask` so `catalog:withReadAccessDo` can yield.
 - Catalog queries that yield (`getTargetPhotos`, `findPhotos`) must run **outside** `withReadAccessDo`. Nesting a yielding query inside the read gate deadlocks on Windows: the task yields to the UI thread holding the gate, never returns, never releases it, wedging the bridge until the server timeout (#124/#134). Only non-yielding per-photo metadata reads belong inside the gate. `getAllPhotos` is a non-yielding enumeration, safe either side. Specs guard this via `getQueriedInsideReadAccess()` in `spec_helper`.
@@ -32,6 +33,7 @@ Use mise tasks from repo root:
 - `mise run dev` — `tsc --watch`
 - `mise run lua:lint` — `selene plugin/LightroomMCP.lrplugin`
 - `mise run lua:test` — `busted` specs for the plugin
+- `mise run skill:test` — Python unittest for bundled skill scripts
 
 Lua tooling: `mise install` provisions `lua` + `luarocks` + `selene`. `lua:test` auto-installs `busted` into `lua_modules/` (gitignored) via the `lua:deps` task. `selene` is a mise tool (`aqua:Kampfkarren/selene`), a native binary that does not run on `lua` — so unlike luacheck it is immune to Lua-version breakage. `selene.toml` configures it; `lightroom.yml` is the custom std declaring LR SDK globals; `JSON.lua` is excluded.
 
@@ -39,6 +41,7 @@ Lua tooling: `mise install` provisions `lua` + `luarocks` + `selene`. `lua:test`
 
 - `.github/workflows/ci.yml` — build+test on ubuntu/macos/windows, Node 24.15.0.
 - `.github/workflows/lua-lint.yml` — selene (via mise-action) on plugin changes.
+- `.github/workflows/skill-test.yml` — Python unittest for bundled skill scripts, on `skills/` changes.
 - Type check runs `npm run check` (`tsc --noEmit` on src + `tsconfig.test.json` on tests); do not break it.
 - Lint runs `npm run lint` (ESLint flat config, type-aware rules over src + tests); do not break it.
 
@@ -52,6 +55,7 @@ Run before every commit (CI runs the same):
 - `mise run test` — Jest suite must pass
 - `mise run lua:lint` — only if Lua changed
 - `mise run lua:test` — only if Lua changed
+- `mise run skill:test` — only if `skills/` changed
 
 ## Plugin install (manual, no automation)
 
@@ -63,7 +67,7 @@ Bundle is pure Lua — same content ships in both `LightroomMCP-macos.lrplugin.z
 
 Click **Start Server** in Plug-in Manager. Logs at `~/Documents/LrClassicLogs/LightroomMCP.log`.
 
-**Reload behaviour**: "Reload Plug-in" cancels the old task's `LrFunctionContext` (freeing its LrSocket ports) and starts fresh. PluginInit sleeps 0.5 s before binding so the context cancel can flush. Server is ready in ~1 s.
+**Reload behaviour**: "Reload Plug-in" loads a fresh Lua state but does **not** reliably cancel the old task's `LrFunctionContext` — the old monitor loop can keep running and hold a port (LrC 15.5.1 macOS). The new instance rewrites the token file; the old loop polls it (`isSuperseded`) and exits on a foreign token, releasing its ports via the context cleanup handler. The new instance's binds fail with `failed to open` until then and recover through the reconnect path.
 
 ## Conventions
 

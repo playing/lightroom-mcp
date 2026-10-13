@@ -5,9 +5,9 @@ local helper = require 'spec_helper'
 -- module body + resetForReload + PluginInit wiring; none of it binds a
 -- socket at load time (binding happens only inside startServer).
 local HANDLER_MODULES = {
-    'JSON', 'HandlerSearch', 'HandlerCollections', 'HandlerMetadata',
+    'JSON', 'HandlerSearch', 'HandlerCollections', 'HandlerKeywords', 'HandlerMetadata',
     'HandlerOrganization', 'HandlerImport', 'HandlerExport',
-    'HandlerSelection', 'HandlerDevelop', 'HandlerVirtualCopies',
+    'HandlerSelection', 'HandlerDevelop', 'HandlerVirtualCopies', 'HandlerPreview',
 }
 
 -- opts (all optional) let a test drive the otherwise-async server task:
@@ -19,6 +19,9 @@ local HANDLER_MODULES = {
 --   capturedBinds  -- array; each LrSocket.bind opts table is appended, in
 --                      bind order (request socket first, then response), so
 --                      a test can invoke onConnected/onMessage/etc directly
+--   onSleep        -- called with the shared state on each LrTasks.sleep, so a
+--                      test can flip flags between monitor-loop ticks
+--   sends          -- array; every line written to a bound socket lands here
 local function installStubs(prefs, asyncTasks, opts)
     opts = opts or {}
     helper.installImport({
@@ -34,6 +37,7 @@ local function installStubs(prefs, asyncTasks, opts)
                 if opts.stopLoopOnSleep and _G.LightroomMCP_State then
                     _G.LightroomMCP_State.running = false
                 end
+                if opts.onSleep then opts.onSleep(_G.LightroomMCP_State) end
             end,
             pcall = pcall,
         },
@@ -60,7 +64,9 @@ local function installStubs(prefs, asyncTasks, opts)
                     reconnect = function()
                         if opts.socketOps then table.insert(opts.socketOps, "reconnect") end
                     end,
-                    send = function() end,
+                    send = function(_, line)
+                        if opts.sends then table.insert(opts.sends, line) end
+                    end,
                 }
             end,
         },
@@ -209,6 +215,69 @@ describe("PluginInfoProvider server task", function()
         io.open = realOpen
     end)
 
+    describe("undecodable requests", function()
+        local function startServerCapturing(sends)
+            local binds = {}
+            installStubs(nil, nil, {
+                runTask = true, stopLoopOnSleep = true, cleanups = {},
+                capturedBinds = binds, sends = sends,
+            })
+            package.loaded.JSON = nil
+            local mod = loadInfoProvider()
+            mod.startServer()
+            _G.LightroomMCP_State.sendConnected = true
+            return binds
+        end
+
+        local function malformed(token)
+            return '{"hello":"' .. token .. '","id":"req_1","action":"ping","params":{"x":"\\q"}}'
+        end
+
+        it("answers an authenticated client instead of leaving it to time out", function()
+            local sends = {}
+            local binds = startServerCapturing(sends)
+
+            binds[1].onMessage(nil, malformed(_G.LightroomMCP_State.token))
+
+            assert.is_not_nil(sends[1])
+            assert.is_nil(sends[2])
+            assert.is_not_nil(sends[1]:find('"id":"req_1"', 1, true))
+            assert.is_not_nil(sends[1]:find('Malformed request', 1, true))
+        end)
+
+        it("stays silent when the salvaged token does not match", function()
+            local sends = {}
+            local binds = startServerCapturing(sends)
+
+            binds[1].onMessage(nil, malformed("not-the-token"))
+
+            assert.is_nil(sends[1])
+        end)
+
+        it("stays silent when no id can be salvaged", function()
+            local sends = {}
+            local binds = startServerCapturing(sends)
+
+            binds[1].onMessage(nil, '{"hello":"' .. _G.LightroomMCP_State.token .. '","action":"ping"')
+
+            assert.is_nil(sends[1])
+        end)
+    end)
+
+    it("can start again after a stop, without a reload in between", function()
+        installStubs(nil, nil, { runTask = false, cleanups = {} })
+        local mod = loadInfoProvider()
+
+        mod.startServer()
+        assert.is_true(_G.LightroomMCP_State.running)
+
+        mod.stopServer()
+        assert.is_false(_G.LightroomMCP_State.running)
+
+        mod.startServerFromPanel()
+        assert.is_true(_G.LightroomMCP_State.running)
+    end)
+
     it("bumps instanceId on every start", function()
         installStubs(nil, nil, { runTask = true, stopLoopOnSleep = true, cleanups = {} })
         local mod = loadInfoProvider()
@@ -331,6 +400,86 @@ describe("stale-connection follow-up fixes (PR #151 re-review)", function()
     end)
 end)
 
+describe("superseded instance after Reload Plug-in (issue #225)", function()
+    local realOpen
+    local fileToken
+    local writeFails
+
+    before_each(function()
+        _G.LightroomMCP_State = nil
+        fileToken = nil
+        writeFails = false
+        realOpen = io.open
+        io.open = function(path, mode, ...)
+            if mode and mode:find("w", 1, true) then
+                if writeFails then return nil, "permission denied" end
+                return { write = function(_, data) fileToken = data end, close = function() end }
+            end
+            if path:find("lightroom-mcp/token", 1, true) then
+                if fileToken == nil then return nil end
+                return { read = function() return fileToken end, close = function() end }
+            end
+            return realOpen(path, mode, ...)
+        end
+    end)
+    after_each(function()
+        io.open = realOpen
+    end)
+
+    it("treats only a readable, different token as proof of a newer instance", function()
+        local mod = loadInfoProvider()
+        assert.is_true(mod.isSuperseded("mine", "theirs"))
+        assert.is_false(mod.isSuperseded("mine", "mine"))
+        assert.is_false(mod.isSuperseded("mine", nil))
+        assert.is_false(mod.isSuperseded("mine", ""))
+        assert.is_false(mod.isSuperseded(nil, "theirs"))
+    end)
+
+    -- Drives the monitor loop for up to maxTicks sleeps; `swapAt` rewrites the
+    -- token file mid-run the way a reloaded instance's startServer does.
+    local function runLoop(maxTicks, swapAt)
+        local ticks = 0
+        local cleanups = {}
+        installStubs(nil, nil, {
+            runTask = true,
+            cleanups = cleanups,
+            onSleep = function(state)
+                ticks = ticks + 1
+                if swapAt and ticks == swapAt then fileToken = "newer-instance" end
+                if ticks >= maxTicks then state.running = false end
+            end,
+        })
+        local mod = loadInfoProvider()
+        mod.startServer()
+        return ticks, cleanups
+    end
+
+    it("stops the loop once a newer instance rewrites the token file", function()
+        local ticks = runLoop(50, 2)
+        assert.is_true(ticks < 50)
+        assert.is_false(_G.LightroomMCP_State.running)
+        local log = _G.LightroomMCP_State.log
+        local found = false
+        for _, line in ipairs(log) do
+            if line:find("Superseded by a newer plugin instance", 1, true) then found = true end
+        end
+        assert.is_true(found)
+    end)
+
+    it("keeps serving while the token file still holds its own token", function()
+        local ticks = runLoop(50, nil)
+        assert.are.equal(50, ticks)
+        assert.are.equal(_G.LightroomMCP_State.token, fileToken)
+    end)
+
+    it("never stops itself when its own token write failed", function()
+        writeFails = true
+        fileToken = "predecessor"
+        local ticks = runLoop(50, nil)
+        assert.are.equal(50, ticks)
+    end)
+end)
+
 describe("heartbeat / stale-connection blast radius (PR #151 review)", function()
     before_each(function()
         _G.LightroomMCP_State = nil
@@ -347,6 +496,28 @@ describe("heartbeat / stale-connection blast radius (PR #151 review)", function(
         assert.are.equal(30, mod.HEARTBEAT_INTERVAL_SECONDS)
         assert.are.equal(90, mod.STALE_RECONNECT_SECONDS)
         assert.are.equal(120, mod.STALE_RESTART_HARD_CAP_SECONDS)
+    end)
+
+    describe("logBindFailure", function()
+        local function lastLog()
+            local log = _G.LightroomMCP_State.log
+            return log[#log]
+        end
+
+        it("names the port so a foreign listener is visible in the log", function()
+            local mod = loadInfoProvider()
+            assert.is_true(mod.logBindFailure("RESPONSE", 58764, "failed to open localhost:58764", 1000))
+            assert.truthy(lastLog():find("RESPONSE port 58764 failed to open", 1, true))
+        end)
+
+        it("throttles repeats per side within the interval", function()
+            local mod = loadInfoProvider()
+            local interval = mod.BIND_FAILURE_LOG_INTERVAL_SECONDS
+            assert.is_true(mod.logBindFailure("RESPONSE", 58764, "failed to open", 2000))
+            assert.is_false(mod.logBindFailure("RESPONSE", 58764, "failed to open", 2000 + interval - 1))
+            assert.is_true(mod.logBindFailure("REQUEST", 58763, "failed to open", 2000 + interval - 1))
+            assert.is_true(mod.logBindFailure("RESPONSE", 58764, "failed to open", 2000 + interval))
+        end)
     end)
 
     describe("shouldRestartForStaleConnection", function()
@@ -389,4 +560,278 @@ describe("heartbeat / stale-connection blast radius (PR #151 review)", function(
             assert.is_false(restart)
         end)
     end)
+end)
+
+describe("cooperative shutdown at Lightroom quit (issue 195)", function()
+    local realOpen
+    local logOpens
+    before_each(function()
+        _G.LightroomMCP_State = nil
+        logOpens = 0
+        realOpen = io.open
+        io.open = function(path, mode, ...)
+            if path and path:find("LightroomMCP.log", 1, true) then
+                logOpens = logOpens + 1
+            end
+            if mode and mode:find("w", 1, true) then
+                return { write = function() end, close = function() end }
+            end
+            return realOpen(path, mode, ...)
+        end
+    end)
+    after_each(function()
+        io.open = realOpen
+        package.preload.PluginInfoProvider = nil
+    end)
+
+    local function requestFor(state, action)
+        return '{"id":1,"action":"' .. action .. '","hello":"' .. state.token .. '"}'
+    end
+
+    it("clears connection state without blocking on sockets or the log file", function()
+        local ops = {}
+        installStubs(nil, nil, { runTask = true, stopLoopOnSleep = true, cleanups = {}, socketOps = ops })
+        local mod = loadInfoProvider()
+
+        mod.startServer()
+        logOpens = 0
+        mod.shutdown()
+
+        local state = _G.LightroomMCP_State
+        assert.is_true(state.shuttingDown)
+        assert.is_false(state.running)
+        assert.is_false(state.sendConnected)
+        assert.is_false(state.receiveConnected)
+        assert.is_nil(state.token)
+        assert.are.same({}, ops)
+        assert.are.equal(0, logOpens)
+    end)
+
+    it("leaves the sockets for the server task to release", function()
+        local ops, cleanups = {}, {}
+        installStubs(nil, nil, { runTask = true, stopLoopOnSleep = true, cleanups = cleanups, socketOps = ops })
+        local mod = loadInfoProvider()
+
+        mod.startServer()
+        mod.shutdown()
+
+        assert.is_not_nil(_G.LightroomMCP_State.requestSocket)
+        assert.is_not_nil(_G.LightroomMCP_State.responseSocket)
+
+        cleanups[1]()
+
+        assert.are.same({ "close", "close" }, ops)
+        assert.is_nil(_G.LightroomMCP_State.requestSocket)
+        assert.is_nil(_G.LightroomMCP_State.responseSocket)
+    end)
+
+    it("is a cheap no-op when the server never started", function()
+        local ops = {}
+        installStubs(nil, nil, { socketOps = ops })
+        local mod = loadInfoProvider()
+
+        assert.has_no.errors(function() mod.shutdown() end)
+        assert.are.same({}, ops)
+        assert.is_true(_G.LightroomMCP_State.shuttingDown)
+    end)
+
+    it("leaves the monitor loop on the first tick after quit begins", function()
+        local ticks = 0
+        installStubs(nil, {}, {
+            runTask = true,
+            cleanups = {},
+            onSleep = function(state)
+                ticks = ticks + 1
+                if ticks == 1 then
+                    state.shuttingDown = true
+                else
+                    state.running = false
+                end
+            end,
+        })
+        local mod = loadInfoProvider()
+
+        mod.startServer()
+
+        assert.are.equal(1, ticks)
+    end)
+
+    it("does not bind a new response listener when quit lands inside the rebind yield", function()
+        local binds = {}
+        local ticks = 0
+        installStubs(nil, {}, {
+            runTask = true,
+            cleanups = {},
+            capturedBinds = binds,
+            onSleep = function(state)
+                ticks = ticks + 1
+                if ticks == 1 then
+                    state.responseNeedsRebind = true
+                elseif ticks == 2 then
+                    state.shuttingDown = true
+                else
+                    state.running = false
+                end
+            end,
+        })
+        local mod = loadInfoProvider()
+
+        mod.startServer()
+
+        assert.is_table(binds[2])
+        assert.is_nil(binds[3])
+    end)
+
+    it("queues no dispatch task for a message that arrives during quit", function()
+        local binds, asyncTasks = {}, {}
+        installStubs(nil, asyncTasks, {
+            runTask = true, stopLoopOnSleep = true, cleanups = {}, capturedBinds = binds,
+        })
+        package.loaded.JSON = nil
+        local mod = loadInfoProvider()
+
+        mod.startServer()
+        local state = _G.LightroomMCP_State
+        state.shuttingDown = true
+        binds[1].onMessage(nil, requestFor(state, "ping"))
+
+        assert.is_nil(asyncTasks[1])
+    end)
+
+    it("does not run a handler whose dispatch task was queued before quit", function()
+        local binds, asyncTasks = {}, {}
+        local handlerCalls = 0
+        installStubs(nil, asyncTasks, {
+            runTask = true, stopLoopOnSleep = true, cleanups = {}, capturedBinds = binds,
+        })
+        package.loaded.JSON = nil
+        package.loaded.HandlerSearch = {
+            searchPhotos = function()
+                handlerCalls = handlerCalls + 1
+                return { photos = {} }
+            end,
+        }
+        local mod = loadInfoProvider()
+
+        mod.startServer()
+        local state = _G.LightroomMCP_State
+        binds[1].onMessage(nil, requestFor(state, "search_photos"))
+        state.shuttingDown = true
+        asyncTasks[1]()
+
+        assert.are.equal(0, handlerCalls)
+    end)
+
+    it("drops the response of a handler that finished after quit began", function()
+        local binds, sent = {}, {}
+        installStubs(nil, nil, {
+            runTask = true, stopLoopOnSleep = true, cleanups = {}, capturedBinds = binds,
+        })
+        package.loaded.JSON = nil
+        package.loaded.HandlerSearch = {
+            searchPhotos = function()
+                _G.LightroomMCP_State.shuttingDown = true
+                return { photos = {} }
+            end,
+        }
+        local mod = loadInfoProvider()
+
+        mod.startServer()
+        local state = _G.LightroomMCP_State
+        state.sendConnected = true
+        state.responseSocket = { send = function() table.insert(sent, true) end }
+
+        binds[1].onMessage(nil, requestFor(state, "search_photos"))
+
+        assert.are.same({}, sent)
+    end)
+
+    it("stops waiting for the send socket as soon as quit begins", function()
+        local binds = {}
+        local waitSleeps = 0
+        local waiting = false
+        installStubs(nil, nil, {
+            runTask = true, stopLoopOnSleep = true, cleanups = {}, capturedBinds = binds,
+            onSleep = function(state)
+                if not waiting then return end
+                waitSleeps = waitSleeps + 1
+                if waitSleeps == 2 then state.shuttingDown = true end
+            end,
+        })
+        package.loaded.JSON = nil
+        local mod = loadInfoProvider()
+
+        mod.startServer()
+        local state = _G.LightroomMCP_State
+        state.sendConnected = false
+        waiting = true
+
+        binds[1].onMessage(nil, requestFor(state, "ping"))
+
+        assert.are.equal(2, waitSleeps)
+    end)
+
+    it("abandons a pending stale-connection restart", function()
+        local asyncTasks = {}
+        local ticks = 0
+        installStubs(nil, asyncTasks, {
+            runTask = true,
+            cleanups = {},
+            onSleep = function(state)
+                ticks = ticks + 1
+                if ticks == 1 then
+                    state.needsFullRestart = true
+                else
+                    state.running = false
+                end
+            end,
+        })
+        local mod = loadInfoProvider()
+
+        mod.startServer()
+        local instanceBefore = _G.LightroomMCP_State.instanceId
+        _G.LightroomMCP_State.shuttingDown = true
+        local pendingRestart = asyncTasks[1]
+        assert.is_function(pendingRestart)
+        pendingRestart()
+
+        assert.are.equal(instanceBefore, _G.LightroomMCP_State.instanceId)
+    end)
+
+    it("refuses an auto-start that wakes after quit began", function()
+        installStubs(nil, nil, { runTask = true, stopLoopOnSleep = true, cleanups = {} })
+        local mod = loadInfoProvider()
+
+        mod.shutdown()
+        mod.startServer()
+
+        assert.is_false(_G.LightroomMCP_State.running)
+        assert.is_nil(_G.LightroomMCP_State.token)
+    end)
+
+    it("lets the Plug-in Manager Start button supersede an earlier shutdown", function()
+        installStubs(nil, nil, { runTask = true, stopLoopOnSleep = true, cleanups = {} })
+        local mod = loadInfoProvider()
+
+        mod.startServer()
+        mod.shutdown()
+        mod.startServerFromPanel()
+
+        assert.is_false(_G.LightroomMCP_State.shuttingDown)
+        assert.is_not_nil(_G.LightroomMCP_State.token)
+    end)
+
+    it("clears the shutdown flag on reload so the fresh instance can bind", function()
+        installStubs(nil, nil, { runTask = true, stopLoopOnSleep = true, cleanups = {} })
+        local mod = loadInfoProvider()
+
+        mod.startServer()
+        mod.shutdown()
+        mod.resetForReload()
+        mod.startServer()
+
+        assert.is_false(_G.LightroomMCP_State.shuttingDown)
+        assert.is_not_nil(_G.LightroomMCP_State.token)
+    end)
+
 end)

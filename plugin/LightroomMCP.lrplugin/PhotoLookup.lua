@@ -10,11 +10,14 @@ end
 -- Only touches the expensive path metadata when an unresolved identifier
 -- looks like a file path. Returns a parallel array:
 --   results[i] = { id = inputId, photo = photoOrNil }
+-- Preserve the fork's first path match; upstream uses the last match instead.
+-- Neither rule establishes unique identity: guarded writes use verified ids.
 function PhotoLookup.resolveMany(catalog, photoIds)
     local results = {}
     local wantedLocalIds = {}
     local wantedPaths = {}
     local remainingPaths = 0
+    local remainingIds = 0
 
     for i, id in ipairs(photoIds) do
         results[i] = { id = id, photo = nil }
@@ -27,11 +30,13 @@ function PhotoLookup.resolveMany(catalog, photoIds)
             local key = tostring(id)
             if wantedLocalIds[key] == nil then wantedLocalIds[key] = {} end
             table.insert(wantedLocalIds[key], i)
+            remainingIds = remainingIds + 1
         end
     end
 
     -- LrCatalog has no findPhotoByLocalIdentifier, so resolution needs one
     -- catalog pass. Path metadata remains untouched for numeric-only batches.
+    if remainingIds + remainingPaths == 0 then return results end
     for _, p in ipairs(catalog:getAllPhotos()) do
         local lid = p.localIdentifier
         if lid ~= nil then
@@ -39,7 +44,9 @@ function PhotoLookup.resolveMany(catalog, photoIds)
             if indexes then
                 for _, idx in ipairs(indexes) do
                     results[idx].photo = p
+                    remainingIds = remainingIds - 1
                 end
+                wantedLocalIds[tostring(lid)] = nil
             end
         end
         if remainingPaths > 0 then
@@ -53,6 +60,8 @@ function PhotoLookup.resolveMany(catalog, photoIds)
                 wantedPaths[photoPath] = nil
             end
         end
+        -- Adopt upstream's early stop without changing the fork's path contract.
+        if remainingIds + remainingPaths == 0 then break end
     end
 
     return results

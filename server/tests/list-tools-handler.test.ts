@@ -1,22 +1,37 @@
 import { describe, it, expect } from '@jest/globals';
+import { Ajv } from 'ajv';
 import fs from 'node:fs';
 import path from 'node:path';
 import { TOOL_DEFINITIONS, listToolsHandler } from '../src/list-tools-handler.js';
-import { DEVELOP_SETTING_KEYS, TOOL_CONTRACTS } from '../src/tool-contracts.js';
+import {
+  DEVELOP_SETTING_KEYS,
+  POINT_CURVE_SETTING_KEYS,
+  TOOL_CONTRACTS,
+} from '../src/tool-contracts.js';
 
 const EXPECTED_TOOL_NAMES = [
   'search_photos',
   'get_selected_photos',
   'get_photo_metadata',
   'create_virtual_copy',
+  'get_photo_preview',
+  'set_gps',
+  'set_location',
   'list_collections',
   'create_collection',
   'add_to_collection',
   'set_keywords',
+  'list_keywords',
   'set_rating',
+  'set_flag',
   'import_photos',
   'export_photos',
+  'export_photo_metadata',
   'list_develop_presets',
+  'get_develop_preset',
+  'compare_develop_presets',
+  'create_develop_preset',
+  'export_develop_preset',
   'apply_develop_preset',
   'copy_develop_settings',
   'set_develop_settings',
@@ -24,8 +39,8 @@ const EXPECTED_TOOL_NAMES = [
 ] as const;
 
 describe('TOOL_DEFINITIONS', () => {
-  it('contains exactly 16 tools', () => {
-    expect(TOOL_DEFINITIONS).toHaveLength(16);
+  it('contains exactly 26 tools', () => {
+    expect(TOOL_DEFINITIONS).toHaveLength(26);
   });
 
   it('tool names are unique', () => {
@@ -78,13 +93,21 @@ describe('tool required fields', () => {
   it.each<[string, string[]]>([
     ['get_photo_metadata', ['photo_id']],
     ['create_virtual_copy', ['photo_id']],
+    ['get_photo_preview', ['photo_id']],
+    ['set_gps', ['photo_ids', 'latitude', 'longitude']],
+    ['set_location', ['photo_ids']],
     ['create_collection', ['name']],
     ['add_to_collection', ['collection_name', 'photo_ids']],
     ['set_keywords', ['photo_ids']],
     ['set_rating', ['photo_ids', 'rating']],
+    ['set_flag', ['photo_ids', 'flag']],
     ['import_photos', ['source_path']],
     ['export_photos', ['photo_ids', 'destination']],
-    ['apply_develop_preset', ['photo_ids', 'preset_name']],
+    ['export_photo_metadata', ['destination']],
+    ['compare_develop_presets', ['base', 'candidate']],
+    ['create_develop_preset', ['photo_id', 'preset_name', 'settings']],
+    ['export_develop_preset', ['destination_dir']],
+    ['apply_develop_preset', ['photo_ids']],
     ['copy_develop_settings', ['source_id', 'target_ids']],
     ['set_develop_settings', ['photo_id', 'settings']],
     ['set_color_adjustments', ['photo_id', 'adjustments']],
@@ -92,7 +115,14 @@ describe('tool required fields', () => {
     expect(toolRequired(name)).toEqual(required);
   });
 
-  it.each(['search_photos', 'get_selected_photos', 'list_collections', 'list_develop_presets'])(
+  it.each([
+    'search_photos',
+    'get_selected_photos',
+    'list_collections',
+    'list_keywords',
+    'list_develop_presets',
+    'get_develop_preset',
+  ])(
     '%s has no required fields',
     (name) => {
       expect(toolRequired(name)).toBeUndefined();
@@ -108,14 +138,26 @@ describe('set_keywords schema', () => {
     expect(properties.add_keywords.maxItems).toBe(1000);
     expect(properties.remove_keywords.maxItems).toBe(1000);
   });
+
+  it('offers create_missing as an optional boolean', () => {
+    const tool = TOOL_DEFINITIONS.find((t) => t.name === 'set_keywords');
+    const properties = tool?.inputSchema.properties as Record<string, { type?: string }>;
+
+    expect(properties.create_missing.type).toBe('boolean');
+    expect(tool?.inputSchema.required).toEqual(['photo_ids']);
+  });
 });
 
 describe('photo array schema', () => {
   it.each([
     ['add_to_collection', 'photo_ids'],
+    ['set_gps', 'photo_ids'],
+    ['set_location', 'photo_ids'],
     ['set_keywords', 'photo_ids'],
     ['set_rating', 'photo_ids'],
+    ['set_flag', 'photo_ids'],
     ['export_photos', 'photo_ids'],
+    ['export_photo_metadata', 'photo_ids'],
     ['apply_develop_preset', 'photo_ids'],
     ['copy_develop_settings', 'target_ids'],
   ])('%s.%s requires 1-1000 ids', (toolName, propertyName) => {
@@ -163,6 +205,85 @@ describe('develop setting schema', () => {
     expect(properties.settings.additionalProperties).toBe(false);
     expect(properties.settings.minProperties).toBe(1);
     expect(Object.keys(properties.settings.properties ?? {})).toEqual(DEVELOP_SETTING_KEYS);
+  });
+
+  it('uses numeric arrays for point curves and scalar values for ordinary settings', () => {
+    const tool = TOOL_DEFINITIONS.find((t) => t.name === 'set_develop_settings');
+    const properties = tool?.inputSchema.properties as Record<
+      string,
+      {
+        properties?: Record<
+          string,
+          {
+            type?: string;
+            minItems?: number;
+            maxItems?: number;
+            items?: { type?: string; minimum?: number; maximum?: number };
+            oneOf?: unknown[];
+          }
+        >;
+      }
+    >;
+    const settings = properties.settings.properties ?? {};
+
+    for (const key of POINT_CURVE_SETTING_KEYS) {
+      expect(settings[key]).toMatchObject({
+        type: 'array',
+        minItems: 4,
+        maxItems: 64,
+        items: { type: 'integer', minimum: 0, maximum: 255 },
+      });
+    }
+    expect(settings.Exposure2012.oneOf).toBeDefined();
+    expect(settings.Exposure2012.type).toBeUndefined();
+  });
+
+  it('rejects malformed point curve payloads against the published schema', () => {
+    const tool = TOOL_DEFINITIONS.find((t) => t.name === 'set_develop_settings');
+    const validate = new Ajv({ strict: false }).compile(tool!.inputSchema);
+
+    const check = (curve: unknown[]) =>
+      validate({ photo_id: '1', settings: { ToneCurvePV2012: curve } });
+
+    expect(check([0, 0, 64, 48, 192, 210, 255, 255])).toBe(true);
+    expect(check([0, 0, 255, 255])).toBe(true);
+    expect(check([0, 0, 128, 120, 255])).toBe(false);
+    expect(check([0, 0, 128.5, 120, 255, 255])).toBe(false);
+    expect(check([0, 0, 128, 300, 255, 255])).toBe(false);
+    expect(check([0, 0, 128, -1, 255, 255])).toBe(false);
+    expect(check([0, 0])).toBe(false);
+    expect(check(Array.from({ length: 66 }, () => 0))).toBe(false);
+  });
+
+  it('accepts the numeric photo ids the catalog hands back', () => {
+    const ajv = new Ajv({ strict: false });
+    const validateFor = (name: string) =>
+      ajv.compile(TOOL_DEFINITIONS.find((t) => t.name === name)!.inputSchema);
+
+    expect(validateFor('get_photo_metadata')({ photo_id: 914 })).toBe(true);
+    expect(validateFor('get_photo_metadata')({ photo_id: '914' })).toBe(true);
+    expect(validateFor('set_rating')({ photo_ids: [914, '/a.jpg'], rating: 3 })).toBe(true);
+    expect(validateFor('set_develop_settings')({
+      photo_id: 914,
+      settings: { Exposure2012: 0.5 },
+    })).toBe(true);
+    expect(validateFor('copy_develop_settings')({ source_id: 914, target_ids: [915] })).toBe(true);
+
+    expect(validateFor('get_photo_metadata')({ photo_id: '' })).toBe(false);
+    expect(validateFor('set_rating')({ photo_ids: [], rating: 3 })).toBe(false);
+    expect(validateFor('set_rating')({ photo_ids: [true], rating: 3 })).toBe(false);
+  });
+
+  it('requires explicit allowlisted keys when creating a preset checkpoint', () => {
+    const tool = TOOL_DEFINITIONS.find((t) => t.name === 'create_develop_preset');
+    const properties = tool?.inputSchema.properties as Record<
+      string,
+      { items?: { enum?: readonly string[] }; minItems?: number; uniqueItems?: boolean }
+    >;
+
+    expect(properties.settings.items?.enum).toEqual(DEVELOP_SETTING_KEYS);
+    expect(properties.settings.minItems).toBe(1);
+    expect(properties.settings.uniqueItems).toBe(true);
   });
 
   it('matches Lua develop setting allowlist', () => {
@@ -237,6 +358,13 @@ describe('color adjustment schema', () => {
     expect(source).toContain('out["ColorGrade" .. wheel .. "Sat"] = value');
   });
 });
+/**
+ * Lua DISPATCH entries that exist for e2e setup only: reachable from the raw TCP
+ * probe, deliberately absent from TOOL_CONTRACTS so no MCP client can call them.
+ */
+const TEST_ONLY_ACTIONS: Record<string, string> = {
+  set_selection: 'HandlerSelection.setSelection',
+};
 
 describe('tool contracts vs Lua dispatch', () => {
   function parseLuaDispatch(): Record<string, string> {
@@ -259,6 +387,19 @@ describe('tool contracts vs Lua dispatch', () => {
       TOOL_CONTRACTS.map((contract) => [contract.name, contract.luaHandler]),
     );
 
+    for (const action of Object.keys(TEST_ONLY_ACTIONS)) {
+      delete dispatch[action];
+    }
+
     expect(dispatch).toEqual(manifest);
+  });
+
+  it('keeps test-only actions off the MCP tool surface', () => {
+    const dispatch = parseLuaDispatch();
+
+    for (const [action, luaHandler] of Object.entries(TEST_ONLY_ACTIONS)) {
+      expect(dispatch[action]).toBe(luaHandler);
+      expect(TOOL_CONTRACTS.some((contract) => contract.name === action)).toBe(false);
+    }
   });
 });

@@ -1,15 +1,31 @@
-local function fakePhoto(id, path)
+local function fakePhoto(id, path, state)
     return {
         localIdentifier = id,
         getRawMetadata = function(_, key)
-            if key == 'path' then return path end
+            if key == 'path' then
+                if state then state.pathReads = state.pathReads + 1 end
+                return path
+            end
             return nil
         end,
     }
 end
 
+-- Counts how many photos the scan actually touches. The scan reads
+-- localIdentifier on every photo it visits, so proxying that field measures how
+-- far it got -- which a path-read counter cannot do for an all-numeric batch.
+local function countingPhoto(id, path, state)
+    local inner = fakePhoto(id, path, state)
+    return setmetatable({}, {
+        __index = function(_, key)
+            if key == 'localIdentifier' then state.visits = state.visits + 1 end
+            return inner[key]
+        end,
+    })
+end
+
 local function fakeCatalog(photos)
-    local state = { getAllPhotosCalls = 0 }
+    local state = { getAllPhotosCalls = 0, pathReads = 0 }
     local catalog = {
         getAllPhotos = function()
             state.getAllPhotosCalls = state.getAllPhotosCalls + 1
@@ -94,6 +110,89 @@ describe("PhotoLookup.resolveMany", function()
         local catalog, _ = fakeCatalog({})
         local r = PhotoLookup.resolveMany(catalog, {})
         assert.are.equal(0, #r)
+    end)
+
+    -- The scan runs per call on every handler that resolves ids, so on a large
+    -- catalog its cost is the handler's cost. These two pin that down.
+    it("never reads paths when every id is numeric", function()
+        local state = { pathReads = 0 }
+        local photos = {}
+        for i = 1, 5 do photos[i] = fakePhoto(i, "/" .. i .. ".jpg", state) end
+        local catalog = fakeCatalog(photos)
+
+        PhotoLookup.resolveMany(catalog, { "1", "2" })
+
+        assert.are.equal(0, state.pathReads)
+    end)
+
+    it("stops scanning once every requested numeric id is found", function()
+        local state = { pathReads = 0, visits = 0 }
+        local photos = {}
+        for i = 1, 100 do photos[i] = countingPhoto(i, "/" .. i .. ".jpg", state) end
+        local catalog = fakeCatalog(photos)
+
+        local r = PhotoLookup.resolveMany(catalog, { "2" })
+
+        assert.are.equal(photos[2], r[1].photo)
+        assert.are.equal(2, state.visits)
+    end)
+
+    -- Paths are not unique: a virtual copy reports its master's source path.
+    -- This fork historically resolves the first match. Preserve it across the
+    -- upgrade; production guarded writes require a verified numeric id instead.
+    it("preserves the fork's first-match behavior for duplicate paths", function()
+        local master = fakePhoto(1, "/shared.nef")
+        local virtualCopy = fakePhoto(2, "/shared.nef")
+        local catalog, _ = fakeCatalog({ master, virtualCopy })
+
+        local r = PhotoLookup.resolveMany(catalog, { "/shared.nef" })
+
+        assert.are.equal(master, r[1].photo)
+    end)
+
+    it("stops after all first-match path requests are resolved", function()
+        local state = { pathReads = 0, visits = 0 }
+        local photos = {}
+        for i = 1, 100 do photos[i] = countingPhoto(i, "/" .. i .. ".jpg", state) end
+        local catalog = fakeCatalog(photos)
+
+        -- The fork's first-match path contract allows stopping at the 2nd photo.
+        local r = PhotoLookup.resolveMany(catalog, { "/2.jpg" })
+
+        assert.are.equal(photos[2], r[1].photo)
+        assert.are.equal(2, state.pathReads)
+        assert.are.equal(2, state.visits)
+    end)
+
+    it("does not read path metadata for an unknown non-path identifier", function()
+        local state = { pathReads = 0 }
+        local catalog = fakeCatalog({ fakePhoto(1, "/a.jpg", state) })
+        local r = PhotoLookup.resolveMany(catalog, { "missing" })
+        assert.is_nil(r[1].photo)
+        assert.are.equal(0, state.pathReads)
+    end)
+
+    it("resolves repeated ids and paths without stopping before other ids", function()
+        local photos = { fakePhoto(1, "/a.jpg"), fakePhoto(2, "/b.jpg"), fakePhoto(3, "/c.jpg") }
+        local catalog = fakeCatalog(photos)
+        local r = PhotoLookup.resolveMany(catalog, { "1", "1", "/b.jpg", "/b.jpg", "3" })
+        assert.are.equal(photos[1], r[1].photo)
+        assert.are.equal(photos[1], r[2].photo)
+        assert.are.equal(photos[2], r[3].photo)
+        assert.are.equal(photos[2], r[4].photo)
+        assert.are.equal(photos[3], r[5].photo)
+    end)
+
+    it("still scans the whole catalog for an id that matches nothing", function()
+        local state = { pathReads = 0 }
+        local photos = {}
+        for i = 1, 10 do photos[i] = fakePhoto(i, "/" .. i .. ".jpg", state) end
+        local catalog = fakeCatalog(photos)
+
+        local r = PhotoLookup.resolveMany(catalog, { "/missing.jpg" })
+
+        assert.is_nil(r[1].photo)
+        assert.are.equal(10, state.pathReads)
     end)
 end)
 

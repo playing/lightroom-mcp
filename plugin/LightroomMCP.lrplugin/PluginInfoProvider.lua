@@ -11,11 +11,13 @@ local LrFileUtils = import 'LrFileUtils'
 local JSON = require 'JSON'
 local HandlerSearch = require 'HandlerSearch'
 local HandlerCollections = require 'HandlerCollections'
+local HandlerKeywords = require 'HandlerKeywords'
 local HandlerMetadata = require 'HandlerMetadata'
 local HandlerOrganization = require 'HandlerOrganization'
 local HandlerImport = require 'HandlerImport'
 local HandlerExport = require 'HandlerExport'
 local HandlerSelection = require 'HandlerSelection'
+local HandlerPreview = require 'HandlerPreview'
 local HandlerDevelop = require 'HandlerDevelop'
 local HandlerVirtualCopies = require 'HandlerVirtualCopies'
 local Log = require 'Log'
@@ -57,6 +59,7 @@ end
 if not _G.LightroomMCP_State then
     _G.LightroomMCP_State = {
         running = false,
+        shuttingDown = false,
         requestSocket = nil,
         responseSocket = nil,
         sendConnected = false,
@@ -75,6 +78,15 @@ end
 
 local pluginState = _G.LightroomMCP_State
 
+-- Nothing in the plugin raises this any more: the LrShutdownApp and
+-- LrShutdownPlugin hooks were removed because they cost a second or more on
+-- every quit and bought no teardown that Lightroom's own context cancellation
+-- did not already do. The guards stay because shutdown() below is still the
+-- programmatic stop, and re-registering a hook is a one-line change.
+local function shutdownRequested()
+    return pluginState.shuttingDown == true
+end
+
 local function tokenDir()
     return LrPathUtils.child(LrPathUtils.getStandardFilePath("home"), ".config")
 end
@@ -83,12 +95,38 @@ local function tokenFilePath()
     return LrPathUtils.child(LrPathUtils.child(tokenDir(), "lightroom-mcp"), "token")
 end
 
+-- "failed to open" is also what LrSocket reports when something else already
+-- listens on the port: another process, or a pre-reload instance of this
+-- plugin that Reload Plug-in left running. Recovery stays the same
+-- (reconnect), but a persistent one must be visible: otherwise the bridge
+-- connects to that listener, requests or responses vanish, and the log shows
+-- nothing (issue #225). Both instances share the log file, so each line
+-- carries its instance's load time.
+local BIND_FAILURE_LOG_INTERVAL_SECONDS = 10
+local LOADED_AT = os.date("%H:%M:%S")
+local lastBindFailureLog = {}
+
+local function isBindFailure(errStr)
+    return errStr:find("failed to open", 1, true) ~= nil
+end
+
 local function addLog(msg)
     table.insert(pluginState.log, os.date("%H:%M:%S") .. " - " .. msg)
     if #pluginState.log > 100 then
         table.remove(pluginState.log, 1)
     end
     Log.info(msg)
+end
+
+local function logBindFailure(side, port, errStr, now)
+    now = now or os.time()
+    local last = lastBindFailureLog[side]
+    if last and now - last < BIND_FAILURE_LOG_INTERVAL_SECONDS then return false end
+    lastBindFailureLog[side] = now
+    addLog(side .. " port " .. tostring(port) .. " failed to open (" .. errStr
+        .. ", instance loaded " .. LOADED_AT .. "); if this repeats, another process"
+        .. " or a leftover pre-reload instance holds it")
+    return true
 end
 
 local function generateToken()
@@ -117,6 +155,26 @@ local function writeTokenFile(token)
     return true
 end
 
+local function readTokenFile()
+    local fh = io.open(tokenFilePath(), "r")
+    if not fh then return nil end
+    local content = fh:read("*a")
+    fh:close()
+    return content
+end
+
+-- Reload Plug-in loads a fresh Lua state and does NOT reliably cancel the
+-- previous instance's server task (observed on LrC 15.5.1 macOS: the old
+-- loop kept running and held a port until Lightroom quit). The two instances
+-- share nothing but the disk, and every start rewrites the token file, so a
+-- token that is no longer ours means a newer instance took over. An absent
+-- or unreadable file proves nothing and must not stop a live server.
+local function isSuperseded(myToken, fileToken)
+    return myToken ~= nil and fileToken ~= nil and fileToken ~= "" and fileToken ~= myToken
+end
+
+local SUPERSEDED_CHECK_TICKS = 5
+
 local DISPATCH = {
     -- Heartbeat no-op. The MCP server pings on this action every
     -- HEARTBEAT_INTERVAL_SECONDS (server/src/index.ts) so the plugin can
@@ -132,12 +190,25 @@ local DISPATCH = {
     add_to_collection = HandlerCollections.addToCollection,
     get_photo_metadata = HandlerMetadata.getPhotoMetadata,
     create_virtual_copy = HandlerVirtualCopies.createVirtualCopy,
+    get_photo_preview = HandlerPreview.getPhotoPreview,
+    set_gps = HandlerMetadata.setGps,
+    set_location = HandlerMetadata.setLocation,
     set_keywords = HandlerOrganization.setKeywords,
+    list_keywords = HandlerKeywords.listKeywords,
     set_rating = HandlerOrganization.setRating,
+    set_flag = HandlerOrganization.setFlag,
     import_photos = HandlerImport.importPhotos,
     export_photos = HandlerExport.exportPhotos,
+    export_photo_metadata = HandlerExport.exportPhotoMetadata,
     get_selected_photos = HandlerSelection.getSelectedPhotos,
+    -- Test-only, no matching MCP tool contract: only the raw TCP probe
+    -- (manual-test.mjs / the e2e playbook) can reach it. See HandlerSelection.
+    set_selection = HandlerSelection.setSelection,
     list_develop_presets = HandlerDevelop.listDevelopPresets,
+    get_develop_preset = HandlerDevelop.getDevelopPreset,
+    compare_develop_presets = HandlerDevelop.compareDevelopPresets,
+    create_develop_preset = HandlerDevelop.createDevelopPreset,
+    export_develop_preset = HandlerDevelop.exportDevelopPreset,
     apply_develop_preset = HandlerDevelop.applyDevelopPreset,
     copy_develop_settings = HandlerDevelop.copyDevelopSettings,
     set_develop_settings = HandlerDevelop.setDevelopSettings,
@@ -189,9 +260,17 @@ local function shouldRestartForStaleConnection(idle, inFlightRequests, softSecon
 end
 
 local function sendResponse(response)
+    if shutdownRequested() then
+        addLog("Drop response (shutting down) id=" .. tostring(response.id))
+        return
+    end
     local waited = 0
     local selfHealRequested = false
     while not pluginState.sendConnected and waited < SEND_WAIT_SECONDS do
+        if shutdownRequested() then
+            addLog("Drop response (shutting down) id=" .. tostring(response.id))
+            return
+        end
         if not selfHealRequested and waited >= SEND_REBIND_TRIGGER_SECONDS then
             addLog("sendResponse stalled " .. SEND_REBIND_TRIGGER_SECONDS .. "s, requesting rebind id=" .. tostring(response.id))
             pluginState.responseNeedsRebind = true
@@ -214,9 +293,16 @@ local function sendResponse(response)
 end
 
 local function dispatchAction(request)
+    if shutdownRequested() then return end
     local id = request.id
     local action = request.action
     local params = request.params or {}
+
+    if request.undecodable then
+        addLog("Rejecting undecodable request id=" .. tostring(id))
+        sendResponse({ id = id, error = "Malformed request: " .. request.undecodable })
+        return
+    end
 
     -- Heartbeat pings arrive every 30s and are pure liveness noise once the
     -- connection is healthy; skip them here so they don't dominate the
@@ -269,6 +355,15 @@ local function consumeMessage(message)
     local parsedOk, request = pcall(function() return JSON:decode(message) end)
     if not parsedOk or type(request) ~= "table" then
         addLog("JSON decode failed: " .. tostring(message))
+        -- A client that cannot be decoded still deserves an answer, or it sits
+        -- there until its own 30s timeout with no clue why. Salvage id+token by
+        -- pattern: only an authenticated caller gets the error back, so
+        -- unauthenticated garbage stays silent as before.
+        local salvagedToken = message:match('"hello"%s*:%s*"([^"]*)"')
+        local salvagedId = message:match('"id"%s*:%s*"([^"]*)"')
+        if salvagedId and pluginState.token and salvagedToken == pluginState.token then
+            return { id = salvagedId, undecodable = tostring(request) }
+        end
         return nil
     end
 
@@ -284,6 +379,10 @@ local function consumeMessage(message)
 end
 
 local function startServer()
+    if shutdownRequested() then
+        addLog("Start ignored (shutting down)")
+        return
+    end
     if pluginState.running then
         addLog("Already running")
         return
@@ -296,7 +395,8 @@ local function startServer()
     pluginState.running = true
 
     pluginState.token = generateToken()
-    if writeTokenFile(pluginState.token) then
+    local tokenWritten = writeTokenFile(pluginState.token)
+    if tokenWritten then
         addLog("Token written to " .. tokenFilePath())
     end
 
@@ -375,6 +475,7 @@ local function startServer()
                     end
                 end,
                 onMessage = function(_, message)
+                    if shutdownRequested() then return end
                     local request = consumeMessage(message)
                     if request then
                         LrTasks.startAsyncTask(function()
@@ -389,6 +490,9 @@ local function startServer()
                 end,
                 onError = function(_, err)
                     local errStr = tostring(err)
+                    if isBindFailure(errStr) then
+                        logBindFailure("REQUEST", requestPort, errStr)
+                    end
                     if isNoClientError(errStr) then
                         if not pluginState.receiveConnected then
                             pluginState.requestNeedsReconnect = true
@@ -443,6 +547,9 @@ local function startServer()
                 onError = function(_, err)
                     if not isLive() then return end
                     local errStr = tostring(err)
+                    if isBindFailure(errStr) then
+                        logBindFailure("RESPONSE", responsePort, errStr)
+                    end
                     if isNoClientError(errStr) then
                         if not pluginState.sendConnected then
                             pluginState.responseNeedsReconnect = true
@@ -465,7 +572,17 @@ local function startServer()
         pluginState.responseSocket = bindResponse(pluginState.responseGen)
         addLog("RESPONSE bound on " .. responsePort .. " gen=" .. pluginState.responseGen)
 
-        while pluginState.running do
+        -- Without our own token on disk the file still holds a predecessor's,
+        -- which would read as "superseded" and stop this live server.
+        local myToken = tokenWritten and pluginState.token or nil
+        local ticks = 0
+        while pluginState.running and not shutdownRequested() do
+            ticks = ticks + 1
+            if ticks % SUPERSEDED_CHECK_TICKS == 0 and isSuperseded(myToken, readTokenFile()) then
+                addLog("Superseded by a newer plugin instance (token file changed), releasing ports")
+                pluginState.running = false
+                break
+            end
             if pluginState.requestNeedsReconnect and pluginState.requestSocket then
                 pluginState.requestNeedsReconnect = false
                 pluginState.requestSocket:reconnect()
@@ -491,6 +608,7 @@ local function startServer()
                 -- again. The actual server-side reconnect takes ~1s, so
                 -- 100ms here doesn't meaningfully delay recovery.
                 LrTasks.sleep(0.1)
+                if shutdownRequested() then break end
                 pluginState.responseSocket = bindResponse(newGen)
                 pluginState.responseNeedsRebind = false
                 pluginState.responseNeedsReconnect = false
@@ -544,6 +662,11 @@ local function startServer()
     end)
 end
 
+local function startServerFromPanel()
+    pluginState.shuttingDown = false
+    startServer()
+end
+
 local function stopServer()
     if not pluginState.running then
         addLog("Not running")
@@ -562,6 +685,7 @@ end
 -- table) so this module's pluginState and the old loop's closure keep
 -- pointing at the same table — flipping running here is what stops it.
 local function resetForReload()
+    pluginState.shuttingDown = false
     if not pluginState.running then return end
     addLog("Reload detected - resetting previous server instance")
     pluginState.running = false
@@ -596,14 +720,32 @@ local function resetForReload()
     pluginState.inFlightRequests = 0
 end
 
+local function shutdown()
+    pluginState.shuttingDown = true
+    pluginState.running = false
+    pluginState.requestNeedsReconnect = false
+    pluginState.responseNeedsRebind = false
+    pluginState.responseNeedsReconnect = false
+    pluginState.needsFullRestart = false
+    pluginState.freshRestart = false
+    pluginState.sendConnected = false
+    pluginState.receiveConnected = false
+    pluginState.token = nil
+end
+
 addLog("PluginInfoProvider loaded")
 
 local PluginInfoProvider = {
     startServer = startServer,
+    startServerFromPanel = startServerFromPanel,
     stopServer = stopServer,
+    shutdown = shutdown,
     resetForReload = resetForReload,
     -- Exposed for PluginInfoProvider_spec.lua only; not used elsewhere in the plugin.
     shouldRestartForStaleConnection = shouldRestartForStaleConnection,
+    logBindFailure = logBindFailure,
+    isSuperseded = isSuperseded,
+    BIND_FAILURE_LOG_INTERVAL_SECONDS = BIND_FAILURE_LOG_INTERVAL_SECONDS,
     handlePing = DISPATCH.ping,
     HEARTBEAT_INTERVAL_SECONDS = HEARTBEAT_INTERVAL_SECONDS,
     STALE_RECONNECT_SECONDS = STALE_RECONNECT_SECONDS,
@@ -692,14 +834,26 @@ function PluginInfoProvider.sectionsForTopOfDialog(f, propertyTable)
                 height_in_lines = 2,
             },
             f:row {
+                -- Two buttons rather than one toggle. The toggle's title was
+                -- computed once at render, so after Stop it still read "Stop
+                -- Server" and clicking it only logged "Not running" -- there was
+                -- no way to start again without closing and reopening the
+                -- dialog. A bound title does not work here: Lightroom ignores a
+                -- binding on a push_button title.
                 f:push_button {
-                    title = pluginState.running and "Stop Server" or "Start Server",
+                    title = "Start Server",
                     action = function()
                         if pluginState.running then
-                            stopServer()
-                        else
-                            startServer()
+                            addLog("Start ignored (already running)")
+                            return
                         end
+                        startServerFromPanel()
+                    end,
+                },
+                f:push_button {
+                    title = "Stop Server",
+                    action = function()
+                        stopServer()
                     end,
                 },
                 f:push_button {

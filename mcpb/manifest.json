@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "lightroom-mcp",
   "display_name": "Lightroom Classic",
-  "version": "0.9.0",
+  "version": "0.21.0",
   "description": "Bridge Claude to Adobe Lightroom Classic — search, organize, develop, export.",
   "long_description": "Connects Claude to a running Adobe Lightroom Classic instance via a bundled Lua plugin. Tools cover catalog search, virtual copies, collections, ratings, keywords, develop presets, numeric develop settings, color adjustments, import and export. The Lightroom plugin is auto-installed into Lightroom's Modules folder on first run; restart Lightroom once after install to load it.",
   "author": {
@@ -51,6 +51,18 @@
       "description": "Create one Lightroom virtual copy from a source photo."
     },
     {
+      "name": "get_photo_preview",
+      "description": "Get a JPEG preview of a photo as an image."
+    },
+    {
+      "name": "set_gps",
+      "description": "Set the GPS position of photos."
+    },
+    {
+      "name": "set_location",
+      "description": "Set the IPTC location fields of photos."
+    },
+    {
       "name": "list_collections",
       "description": "List all collections and collection sets."
     },
@@ -64,11 +76,19 @@
     },
     {
       "name": "set_keywords",
-      "description": "Add or remove keywords on photos."
+      "description": "Add or remove keywords on photos, by name or hierarchy path."
+    },
+    {
+      "name": "list_keywords",
+      "description": "List the keyword hierarchy as full paths."
     },
     {
       "name": "set_rating",
       "description": "Set star rating on photos."
+    },
+    {
+      "name": "set_flag",
+      "description": "Flag photos as pick or reject, or remove the flag."
     },
     {
       "name": "import_photos",
@@ -79,8 +99,28 @@
       "description": "Export photos with format/quality/dimensions."
     },
     {
+      "name": "export_photo_metadata",
+      "description": "Write metadata for many photos to a JSON file."
+    },
+    {
       "name": "list_develop_presets",
       "description": "List available Develop presets."
+    },
+    {
+      "name": "get_develop_preset",
+      "description": "Read one exact Develop preset and its backing-file metadata."
+    },
+    {
+      "name": "compare_develop_presets",
+      "description": "Compare settings in two Develop presets."
+    },
+    {
+      "name": "create_develop_preset",
+      "description": "Create a versioned plugin-managed preset checkpoint."
+    },
+    {
+      "name": "export_develop_preset",
+      "description": "Export a preset backing file without overwriting existing files."
     },
     {
       "name": "apply_develop_preset",

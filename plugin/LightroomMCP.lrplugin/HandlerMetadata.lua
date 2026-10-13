@@ -1,5 +1,6 @@
 local LrApplication = import 'LrApplication'
 
+local KeywordTree = require 'KeywordTree'
 local PhotoLookup = require 'PhotoLookup'
 local Log = require 'Log'
 
@@ -60,11 +61,16 @@ function MetadataHandler.getPhotoMetadata(args)
         end
 
         -- Get keywords
+        -- `keywords` stays leaf names; `keywordPaths` is the same list as
+        -- full parent-first paths, which is what tells two keywords of the
+        -- same name apart ("Orientation|portrait" vs "Type|portrait").
         local keywords = {}
+        local keywordPaths = {}
         local photoKeywords = photo:getRawMetadata('keywords')
         if photoKeywords then
             for _, kw in ipairs(photoKeywords) do
                 table.insert(keywords, kw:getName())
+                table.insert(keywordPaths, KeywordTree.pathOf(kw))
             end
         end
 
@@ -91,6 +97,7 @@ function MetadataHandler.getPhotoMetadata(args)
             colorLabel = photo:getRawMetadata('colorNameForLabel'),
             pickStatus = photo:getRawMetadata('pickStatus'),
             keywords = keywords,
+            keywordPaths = keywordPaths,
             -- Title / caption / headline (IPTC content description).
             title = photo:getFormattedMetadata('title'),
             caption = photo:getFormattedMetadata('caption'),
@@ -147,6 +154,16 @@ function MetadataHandler.getPhotoMetadata(args)
                 vibrance = developSettings.Vibrance,
                 saturation = developSettings.Saturation,
                 hsl = hslDevelopSettings(developSettings),
+                convertToGrayscale = developSettings.ConvertToGrayscale,
+                toneCurveName = developSettings.ToneCurveName2012,
+                toneCurve = developSettings.ToneCurvePV2012,
+                toneCurveRed = developSettings.ToneCurvePV2012Red,
+                toneCurveGreen = developSettings.ToneCurvePV2012Green,
+                toneCurveBlue = developSettings.ToneCurvePV2012Blue,
+                parametricShadows = developSettings.ParametricShadows,
+                parametricDarks = developSettings.ParametricDarks,
+                parametricLights = developSettings.ParametricLights,
+                parametricHighlights = developSettings.ParametricHighlights,
             }
         }
     end)
@@ -154,6 +171,152 @@ function MetadataHandler.getPhotoMetadata(args)
     Log.info("Retrieved metadata for photo: " .. args.photo_id)
 
     return photoData
+end
+
+local function requireCoordinate(value, name, limit)
+    -- Comparing a string to a number raises a raw Lua type error that leaks
+    -- the handler's file and line to the client, so check the type first.
+    if type(value) ~= "number" or value ~= value or value < -limit or value > limit then
+        error(string.format("%s must be a number between -%d and %d", name, limit, limit))
+    end
+end
+
+-- Bounds the schema enforces too; also rule out Infinity, which JSON carries
+-- to the plugin as null and would otherwise drop silently.
+local MIN_ALTITUDE = -20000
+local MAX_ALTITUDE = 100000
+
+-- Writes a GPS position (decimal degrees) to photos, replacing any position
+-- they already have. Altitude is only touched when given or cleared.
+function MetadataHandler.setGps(args)
+    if not args.photo_ids or #args.photo_ids == 0 then
+        error("photo_ids is required")
+    end
+    requireCoordinate(args.latitude, "latitude", 90)
+    requireCoordinate(args.longitude, "longitude", 180)
+    if args.altitude ~= nil and (type(args.altitude) ~= "number" or args.altitude ~= args.altitude
+        or args.altitude < MIN_ALTITUDE or args.altitude > MAX_ALTITUDE) then
+        error(string.format("altitude must be a number between %d and %d (metres)",
+            MIN_ALTITUDE, MAX_ALTITUDE))
+    end
+    if args.clear_altitude ~= nil and type(args.clear_altitude) ~= "boolean" then
+        error("clear_altitude must be a boolean")
+    end
+    local clearAltitude = args.clear_altitude == true
+    if clearAltitude and args.altitude ~= nil then
+        error("altitude and clear_altitude cannot be used together")
+    end
+
+    local catalog = LrApplication.activeCatalog()
+    local updatedCount = 0
+    local missingIds = {}
+    local missingCount = 0
+
+    local resolved = PhotoLookup.resolveMany(catalog, args.photo_ids)
+
+    catalog:withWriteAccessDo("Set GPS", function()
+        for _, entry in ipairs(resolved) do
+            if entry.photo then
+                entry.photo:setRawMetadata('gps', {
+                    latitude = args.latitude,
+                    longitude = args.longitude,
+                })
+                if args.altitude ~= nil then
+                    entry.photo:setRawMetadata('gpsAltitude', args.altitude)
+                elseif clearAltitude then
+                    entry.photo:setRawMetadata('gpsAltitude', nil)
+                end
+                updatedCount = updatedCount + 1
+            else
+                missingCount = missingCount + 1
+                missingIds[missingCount] = tostring(entry.id)
+            end
+        end
+    end)
+
+    Log.info(string.format("Set GPS to %s, %s for %d photos",
+        tostring(args.latitude), tostring(args.longitude), updatedCount))
+
+    return {
+        success = true,
+        updated = updatedCount,
+        latitude = args.latitude,
+        longitude = args.longitude,
+        altitude = args.altitude,
+        altitude_cleared = clearAltitude or nil,
+        missing = missingIds,
+        message = string.format("Set GPS for %d photos (%d ids not found)",
+            updatedCount, missingCount)
+    }
+end
+
+-- Tool argument -> SDK field, in the order get_photo_metadata reports them.
+-- "Sublocation" is the SDK `location` field.
+local LOCATION_FIELDS = {
+    { arg = "sublocation", key = "location" },
+    { arg = "city", key = "city" },
+    { arg = "state_province", key = "stateProvince" },
+    { arg = "country", key = "country" },
+    { arg = "iso_country_code", key = "isoCountryCode" },
+}
+
+-- Writes the IPTC location fields of photos. Fields left out are unchanged;
+-- an empty string clears a field. GPS is set_gps's job and is not touched.
+function MetadataHandler.setLocation(args)
+    if not args.photo_ids or #args.photo_ids == 0 then
+        error("photo_ids is required")
+    end
+
+    local changes = {}
+    for _, field in ipairs(LOCATION_FIELDS) do
+        local value = args[field.arg]
+        if value ~= nil then
+            if type(value) ~= "string" then
+                error(field.arg .. " must be a string")
+            end
+            -- An empty string is passed through: it is what clears the
+            -- field. Lightroom stores nil on these fields as the text "nil".
+            changes[#changes + 1] = { arg = field.arg, key = field.key, value = value }
+        end
+    end
+    if #changes == 0 then
+        error("give at least one of sublocation, city, state_province, country, iso_country_code")
+    end
+
+    local catalog = LrApplication.activeCatalog()
+    local updatedCount = 0
+    local missingIds = {}
+    local missingCount = 0
+
+    local resolved = PhotoLookup.resolveMany(catalog, args.photo_ids)
+
+    catalog:withWriteAccessDo("Set Location", function()
+        for _, entry in ipairs(resolved) do
+            if entry.photo then
+                for _, change in ipairs(changes) do
+                    entry.photo:setRawMetadata(change.key, change.value)
+                end
+                updatedCount = updatedCount + 1
+            else
+                missingCount = missingCount + 1
+                missingIds[missingCount] = tostring(entry.id)
+            end
+        end
+    end)
+
+    local fields = {}
+    for i, change in ipairs(changes) do fields[i] = change.arg end
+
+    Log.info(string.format("Set location (%s) for %d photos", table.concat(fields, ", "), updatedCount))
+
+    return {
+        success = true,
+        updated = updatedCount,
+        fields = fields,
+        missing = missingIds,
+        message = string.format("Set location for %d photos (%d ids not found)",
+            updatedCount, missingCount)
+    }
 end
 
 return MetadataHandler

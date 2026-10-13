@@ -4,9 +4,11 @@ Lets Claude (and other AI assistants) talk to your **Adobe Lightroom Classic** p
 
 [![npm](https://img.shields.io/npm/v/@mskalski/lightroom-mcp.svg)](https://www.npmjs.com/package/@mskalski/lightroom-mcp)
 [![release](https://img.shields.io/github/v/release/Automaat/lightroom-mcp.svg)](https://github.com/Automaat/lightroom-mcp/releases/latest)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-mskalski-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/mskalski)
 
 > **Works with:** Claude Desktop, Claude Code, Codex CLI, Cursor, Windsurf, VS Code.
 > **Needs:** Lightroom Classic on macOS or Windows. Nothing else — no programming required.
+> **Other languages:** [繁體中文](README.zh-TW.md)
 
 ---
 
@@ -44,6 +46,8 @@ Some other things to try:
 - *"Find all my 5-star photos from last summer."*
 - *"Add the keyword 'portfolio' to the photos I have selected in Lightroom."*
 - *"Apply the 'Vivid' develop preset to these photos."*
+- *"Compare my approved 'John Warm v3' preset with the current candidate."*
+- *"Create a versioned preset checkpoint from this representative photo and export it."*
 - *"Export the selected photos to my Desktop as JPEGs at 2000px wide."*
 
 ---
@@ -155,20 +159,61 @@ If you'd rather drop the plugin in by hand:
 | --- | --- |
 | `search_photos` | Search by filename / keywords / rating / date range. |
 | `get_selected_photos` | Photos selected in Lightroom (or filmstrip). |
-| `get_photo_metadata` | EXIF, GPS, IPTC location, copyright + develop settings for one photo. |
+| `get_photo_metadata` | Keywords (names and full paths), EXIF, GPS, IPTC location, copyright + develop settings for one photo. |
+| `get_photo_preview` | JPEG preview of one photo (raw files too), returned as an image. |
+| `set_gps` | Set the GPS position (decimal degrees) of photos. |
+| `set_location` | Set the IPTC location (sublocation, city, state, country, ISO code) of photos. |
 | `list_collections` | All collections and collection sets. |
 | `create_collection` | New collection (optional parent set). |
 | `add_to_collection` | Add photos to a named collection. |
-| `set_keywords` | Add or remove keywords on photos. |
+| `set_keywords` | Add or remove keywords on photos, by name or by hierarchy path (`Places\|Europe\|Paris`). |
+| `list_keywords` | The keyword hierarchy as full paths, with synonyms. |
 | `set_rating` | Set 0-5 star rating on photos. |
+| `set_flag` | Flag photos as pick or reject, or remove the flag. |
 | `import_photos` | Import a file or folder into the catalog. |
 | `export_photos` | Export with format / quality / dimensions. |
-| `list_develop_presets` | Discover available Develop presets. |
-| `apply_develop_preset` | Apply a named preset to photos. |
+| `export_photo_metadata` | Write metadata (incl. keyword paths) for many photos, or the selection, to a JSON file. |
+| `list_develop_presets` | Discover Lightroom-visible presets and plugin checkpoints. |
+| `get_develop_preset` | Read settings and backing-file metadata for one exact preset. |
+| `compare_develop_presets` | Diff an approved historical preset against a candidate. |
+| `create_develop_preset` | Capture explicit settings from a photo as a versioned plugin checkpoint. |
+| `export_develop_preset` | Copy a custom/checkpoint preset backing file without overwriting. |
+| `apply_develop_preset` | Apply an exact preset by UUID or disambiguated name. |
 | `copy_develop_settings` | Copy develop settings between photos. |
 | `set_develop_settings` | Write SDK setting key/values directly. |
 
 Full schemas and parameter docs: [`server/src/list-tools-handler.ts`](server/src/list-tools-handler.ts).
+
+### Iterative preset workflow
+
+Use a representative photo or virtual copy rather than a master edit:
+
+1. Read an approved historical preset with `get_develop_preset`.
+2. Apply bounded setting changes to the representative and export a Lightroom-rendered JPEG.
+3. Create a uniquely named checkpoint such as `John Warm v4` with `create_develop_preset`.
+4. Compare it with the approved preset using `compare_develop_presets`.
+5. Repeat the render/inspect cycle; export the accepted checkpoint with `export_develop_preset`.
+
+`create_develop_preset` uses Adobe's plugin preset API. These checkpoints are intentionally hidden from the Develop panel and are listed with `scope: "plugin"`. They are versioned instead of overwritten. `export_develop_preset` refuses existing destinations and preserves the backing file format Lightroom supplies. Built-in presets without a backing file cannot be exported.
+
+### Point curves
+
+`set_develop_settings` accepts Lightroom's composite and per-channel point curve
+keys: `ToneCurvePV2012`, `ToneCurvePV2012Red`, `ToneCurvePV2012Green`, and
+`ToneCurvePV2012Blue`. Each value is a flat list of 2 to 32 input/output pairs.
+Values are integers from 0 to 255, inputs must be strictly increasing, and each
+curve must start at input 0 and end at input 255.
+
+```json
+{
+  "photo_id": "283615",
+  "settings": {
+    "ToneCurveName2012": "Custom",
+    "ToneCurvePV2012": [0, 0, 40, 25, 128, 132, 220, 240, 255, 250],
+    "ToneCurvePV2012Blue": [0, 0, 64, 58, 192, 198, 255, 255]
+  }
+}
+```
 
 ## How it works
 
@@ -239,6 +284,7 @@ Repo layout:
 
 - **`failed to open localhost:58763` after Reload Plug-in** — old async task still owns the port. Quit Lightroom (Cmd+Q on macOS / Alt+F4 on Windows) and reopen.
 - **Plugin not connected** — the server now self-restarts after a Reload Plug-in that tore down a running instance. If it's still stopped, click **Start Server** in Plug-in Manager; it reconnects within ~1s.
+- **Lightroom hangs on "performing shutdown tasks" when quitting**, or warns that "a shutdown task for the plug-in became unresponsive" — fixed by removing the plugin's shutdown hooks. `LrShutdownApp` requires the script to return a table whose `LrShutdownFunction` calls Lightroom's `doneFunction`; without it Lightroom waits out a no-progress timeout on every quit, and even with it the shutdown dialog still costs about a second. The hooks bought nothing: Lightroom cancels the plugin's function context on quit, disable and reload, and that cleanup handler already closes both ports. Measured on macOS: 7.7 s with the hooks, 0.1 s without. If a future change needs work done at quit, re-register `LrShutdownApp` and return that table.
 - **Timeout errors** — handler may be scanning a large catalog without filters; add `rating`, `filename`, `keywords`, or date filters to narrow.
 - **macOS "cannot be opened because the developer cannot be verified"** (binary path) — `xattr -d com.apple.quarantine /path/to/binary`. Or right-click → Open the first time.
 - **Windows SmartScreen blocks the .exe** — More info → Run anyway.

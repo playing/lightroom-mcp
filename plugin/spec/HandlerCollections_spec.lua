@@ -74,9 +74,35 @@ describe("HandlerCollections.createCollection", function()
         local _, Handler = setup({})
         assert.has_error(function() Handler.createCollection({}) end)
     end)
+
+    it("rejects an empty or whitespace-only name", function()
+        local _, Handler = setup({})
+        assert.has_error(function() Handler.createCollection({ name = "" }) end, "name is required")
+        assert.has_error(function() Handler.createCollection({ name = "   " }) end, "name is required")
+    end)
+
+    it("rejects a duplicate name that would make lookup ambiguous", function()
+        local existing = helper.fakeCollection("Album", {})
+        local catalog, Handler = setup({ collections = { existing } })
+
+        assert.has_error(
+            function() Handler.createCollection({ name = "Album" }) end,
+            "Collection already exists: Album")
+        assert.is_nil(catalog.getCreatedCollections()[1])
+    end)
 end)
 
 describe("HandlerCollections.addToCollection", function()
+    it("resolves photos OUTSIDE the write-access gate", function()
+        local p1 = helper.fakePhoto({ id = "1", path = "/a.jpg" })
+        local target = helper.fakeCollection("Target", {})
+        local catalog, Handler = setup({ photos = { p1 }, collections = { target } })
+
+        Handler.addToCollection({ collection_name = "Target", photo_ids = { "1" } })
+
+        assert.is_false(catalog.getQueriedInsideWriteAccess())
+    end)
+
     it("adds matching photos to the named collection", function()
         local p1 = helper.fakePhoto({ id = "1", path = "/a.jpg" })
         local p2 = helper.fakePhoto({ id = "2", path = "/b.jpg" })
@@ -98,6 +124,35 @@ describe("HandlerCollections.addToCollection", function()
         assert.has_error(function()
             Handler.addToCollection({ collection_name = "Nope", photo_ids = { "1" } })
         end)
+    end)
+
+    -- Resolving ids scans the whole catalog, which on a large library outruns
+    -- the server's request timeout. Paying that before noticing a typo'd
+    -- collection name turns a clear "Collection not found" into no answer.
+    it("rejects an unknown collection without scanning the catalog", function()
+        local p1 = helper.fakePhoto({ id = "1", path = "/a.jpg" })
+        local catalog, Handler = setup({ photos = { p1 } })
+
+        assert.has_error(function()
+            Handler.addToCollection({ collection_name = "Nope", photo_ids = { "/missing.raw" } })
+        end)
+
+        assert.are.equal(0, catalog.getQueryCount())
+    end)
+
+    it("reports ids that matched no photo", function()
+        local p1 = helper.fakePhoto({ id = "1", path = "/a.jpg" })
+        local target = helper.fakeCollection("Target", {})
+        local _, Handler = setup({ photos = { p1 }, collections = { target } })
+
+        local r = Handler.addToCollection({
+            collection_name = "Target",
+            photo_ids = { "1", "ghost" },
+        })
+
+        assert.are.equal(1, r.added)
+        assert.are.same({ "ghost" }, r.missing)
+        assert.is_not_nil(r.message:find("1 ids not found", 1, true))
     end)
 
     it("errors without required args", function()

@@ -3,6 +3,18 @@ import { validateToolArgs } from '../src/validate-args.js';
 import { createCallToolHandler } from '../src/tool-handler.js';
 
 describe('validateToolArgs', () => {
+  it('accepts explicit export location choices and rejects string booleans', () => {
+    const base = { photo_ids: [914], destination: '/tmp' };
+
+    expect(validateToolArgs('export_photos', base)).toBeNull();
+    expect(validateToolArgs('export_photos', { ...base, include_location_metadata: true })).toBeNull();
+    expect(validateToolArgs('export_photos', { ...base, include_location_metadata: false })).toBeNull();
+    for (const value of ['true', 'false', 0, 1, null]) {
+      expect(validateToolArgs('export_photos', { ...base, include_location_metadata: value }))
+        .toContain('include_location_metadata');
+    }
+  });
+
   it('accepts arguments that satisfy the published schema', () => {
     expect(validateToolArgs('get_photo_metadata', { photo_id: 914 })).toBeNull();
     expect(validateToolArgs('get_photo_metadata', { photo_id: '/a.jpg' })).toBeNull();
@@ -120,6 +132,19 @@ describe('validateToolArgs', () => {
 });
 
 describe('tool handler argument validation', () => {
+  it('forwards an explicit export location choice unchanged', async () => {
+    const call = jest.fn((_action: string, _params: unknown) =>
+      Promise.resolve({ id: 'req_1', result: { success: true } }));
+    const handler = createCallToolHandler({ dispatcher: { call }, isReady: () => true });
+
+    for (const includeLocation of [true, false]) {
+      const args = { photo_ids: [914], destination: '/tmp', include_location_metadata: includeLocation };
+      const res = await handler('export_photos', args);
+      expect(res.isError).toBeUndefined();
+      expect(call).toHaveBeenLastCalledWith('export_photos', args);
+    }
+  });
+
   it('fails before touching Lightroom', async () => {
     const call = jest.fn((_action: string, _params: unknown) =>
       Promise.resolve({ id: 'req_1', result: {} }));

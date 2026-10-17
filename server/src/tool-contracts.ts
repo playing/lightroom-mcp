@@ -683,6 +683,12 @@ export const TOOL_CONTRACTS: ToolContract[] = [
             "What to do when the destination already holds a file with that name (default rename). Lightroom never prompts.",
           enum: ["rename", "overwrite", "skip"],
         },
+        include_location_metadata: {
+          type: "boolean",
+          default: false,
+          description:
+            "Retain GPS and other location metadata in rendered exports (default false). Other embedded metadata is included. Set true explicitly for geotagged deliveries; this cannot create coordinates absent from the photo.",
+        },
       },
       required: ["photo_ids", "destination"],
     },

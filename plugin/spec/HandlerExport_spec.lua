@@ -47,6 +47,42 @@ describe("HandlerExport.exportPhotos", function()
         assert.are.equal("skip", calls[3].exportSettings.LR_collisionHandling)
     end)
 
+    it("sets metadata policy explicitly and keeps location opt-in", function()
+        local p = helper.fakePhoto({ id = "1", path = "/a.jpg" })
+        local _, Handler, calls = setup({ photos = { p } })
+
+        Handler.exportPhotos({ photo_ids = { "1" }, destination = "/out" })
+        local s = calls[1].exportSettings
+        assert.are.equal('all', s.LR_embeddedMetadataOption)
+        assert.is_false(s.LR_minimizeEmbeddedMetadata)
+        assert.is_true(s.LR_removeLocationMetadata)
+    end)
+
+    it("maps both explicit location choices to the SDK without losing false", function()
+        local p = helper.fakePhoto({ id = "1", path = "/a.jpg" })
+        local _, Handler, calls = setup({ photos = { p } })
+
+        Handler.exportPhotos({ photo_ids = { "1" }, destination = "/out", include_location_metadata = true })
+        assert.is_false(calls[1].exportSettings.LR_removeLocationMetadata)
+        assert.are.equal('all', calls[1].exportSettings.LR_embeddedMetadataOption)
+        assert.is_false(calls[1].exportSettings.LR_minimizeEmbeddedMetadata)
+
+        Handler.exportPhotos({ photo_ids = { "1" }, destination = "/out", include_location_metadata = false })
+        assert.is_true(calls[2].exportSettings.LR_removeLocationMetadata)
+    end)
+
+    it("rejects a non-boolean location policy before starting an export", function()
+        local p = helper.fakePhoto({ id = "1", path = "/a.jpg" })
+        local _, Handler, calls = setup({ photos = { p } })
+
+        for _, value in ipairs({ 'true', 'false', 0, 1, {} }) do
+            assert.has_error(function()
+                Handler.exportPhotos({ photo_ids = { "1" }, destination = "/out", include_location_metadata = value })
+            end, "include_location_metadata must be a boolean")
+        end
+        assert.are.equal(0, #calls)
+    end)
+
     it("rejects an unknown on_existing mode, including Lightroom's own ask", function()
         local p = helper.fakePhoto({ id = "1", path = "/a.jpg" })
         local _, Handler = setup({ photos = { p } })

@@ -175,7 +175,7 @@ If you'd rather drop the plugin in by hand:
 | `set_rating` | Set 0-5 star rating on photos. |
 | `set_flag` | Flag photos as pick or reject, or remove the flag. |
 | `import_photos` | Import a file or folder into the catalog. |
-| `export_photos` | Export with format / quality / dimensions. |
+| `export_photos` | Export with format / quality / dimensions. Set `include_location_metadata: true` explicitly to retain GPS/location in rendered exports. |
 | `export_photo_metadata` | Write metadata (incl. keyword paths) for many photos, or the selection, to a JSON file. |
 | `list_develop_presets` | Discover Lightroom-visible presets and plugin checkpoints. |
 | `get_develop_preset` | Read settings and backing-file metadata for one exact preset. |

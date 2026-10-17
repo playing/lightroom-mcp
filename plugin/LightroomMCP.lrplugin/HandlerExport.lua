@@ -70,12 +70,24 @@ function ExportHandler.exportPhotos(args)
         error("on_existing must be one of: rename, overwrite, skip")
     end
 
+    if args.include_location_metadata ~= nil and type(args.include_location_metadata) ~= 'boolean' then
+        error("include_location_metadata must be a boolean")
+    end
+
     local exportSettings = {
         LR_export_destinationType = 'specificFolder',
         LR_export_destinationPathPrefix = args.destination,
         LR_export_useSubfolder = false,
         LR_jpeg_quality = args.quality or 90,
         LR_collisionHandling = COLLISION_HANDLING[collisionHandling],
+        -- "All metadata" alone is insufficient: Lightroom can still remove
+        -- GPS/location. Set both policies explicitly rather than depending
+        -- on Lightroom defaults or the user's last native export settings.
+        -- Keep location opt-in for existing callers. An explicit false must
+        -- stay false; Lua's `value or default` cannot represent that policy.
+        LR_embeddedMetadataOption = 'all',
+        LR_minimizeEmbeddedMetadata = false,
+        LR_removeLocationMetadata = args.include_location_metadata ~= true,
     }
 
     -- Set dimensions if specified

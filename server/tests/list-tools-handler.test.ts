@@ -21,6 +21,7 @@ const EXPECTED_TOOL_NAMES = [
   'list_collections',
   'create_collection',
   'add_to_collection',
+  'get_collection_photos',
   'remove_from_collection',
   'delete_collection',
   'set_keywords',
@@ -43,8 +44,8 @@ const EXPECTED_TOOL_NAMES = [
 ] as const;
 
 describe('TOOL_DEFINITIONS', () => {
-  it('contains exactly 30 tools', () => {
-    expect(TOOL_DEFINITIONS).toHaveLength(30);
+  it('contains exactly 31 tools', () => {
+    expect(TOOL_DEFINITIONS).toHaveLength(31);
   });
 
   it('tool names are unique', () => {
@@ -103,6 +104,7 @@ describe('tool required fields', () => {
     ['set_metadata', ['photo_ids']],
     ['create_collection', ['name']],
     ['add_to_collection', ['collection_name', 'photo_ids']],
+    ['get_collection_photos', ['collection_name']],
     ['remove_from_collection', ['collection_name', 'photo_ids']],
     ['delete_collection', ['collection_name']],
     ['set_keywords', ['photo_ids']],

@@ -72,6 +72,66 @@ function KeywordTree.findChild(catalog, parent, name)
     return nil
 end
 
+-- Children of `parent` (or the top level) keyed by folded name, the first
+-- match winning as in findChild. One pass for many lookups: findChild reads
+-- every sibling's name again for each one.
+local function indexByName(keywords)
+    local index = {}
+    for _, child in ipairs(keywords) do
+        local folded = KeywordTree.fold(child:getName())
+        if index[folded] == nil then
+            index[folded] = child
+        end
+    end
+    return index
+end
+
+function KeywordTree.childIndex(catalog, parent)
+    return indexByName(KeywordTree.children(catalog, parent))
+end
+
+local topCache = nil
+
+local function sameMembers(cache, keywords)
+    if cache.count ~= #keywords then
+        return false
+    end
+    for _, keyword in ipairs(keywords) do
+        if not cache.members[keyword] then
+            return false
+        end
+    end
+    return true
+end
+
+function KeywordTree.topIndex(catalog)
+    local keywords = KeywordTree.children(catalog, nil)
+    if not topCache or not sameMembers(topCache, keywords) then
+        local members = {}
+        for _, keyword in ipairs(keywords) do
+            members[keyword] = true
+        end
+        topCache = { count = #keywords, members = members, index = indexByName(keywords) }
+    end
+    return topCache.index
+end
+
+function KeywordTree.forgetTopIndex()
+    topCache = nil
+end
+
+-- findChild(catalog, nil, name) through the cached index. A hit that has been
+-- renamed or moved since the index was built is a miss; a miss does not
+-- rebuild the index.
+function KeywordTree.findTopLevel(catalog, name)
+    local folded = KeywordTree.fold(name)
+    local keyword = KeywordTree.topIndex(catalog)[folded]
+    if keyword and not keyword:getParent() and KeywordTree.fold(keyword:getName()) == folded then
+        return keyword
+    end
+    return nil
+end
+
 -- Walks `parts` from the top level. Returns the keyword, or nil plus the
 -- number of leading levels that did resolve.
 function KeywordTree.resolve(catalog, parts)
@@ -87,7 +147,8 @@ function KeywordTree.resolve(catalog, parts)
 end
 
 -- Depth-first, parent before children, siblings in name order so repeated
--- calls page through the tree in a stable order. `visit(keyword, path)`.
+-- calls page through the tree in a stable order.
+-- `visit(keyword, path, attributes)`, attributes as from getAttributes.
 function KeywordTree.walk(catalog, root, visit)
     local function descend(parent, prefix)
         -- Names are read BEFORE sorting: LrKeyword getters can yield, which is
@@ -96,8 +157,11 @@ function KeywordTree.walk(catalog, root, visit)
         -- not allowed within a C or metamethod call".
         local kids = {}
         for _, child in ipairs(KeywordTree.children(catalog, parent)) do
-            local name = child:getName()
-            kids[#kids + 1] = { keyword = child, name = name, lower = KeywordTree.fold(name) }
+            local attributes = child:getAttributes() or {}
+            local name = attributes.keywordName or child:getName()
+            kids[#kids + 1] = {
+                keyword = child, name = name, lower = KeywordTree.fold(name), attributes = attributes,
+            }
         end
         table.sort(kids, function(a, b)
             if a.lower ~= b.lower then return a.lower < b.lower end
@@ -105,7 +169,7 @@ function KeywordTree.walk(catalog, root, visit)
         end)
         for _, kid in ipairs(kids) do
             local path = prefix .. kid.name
-            visit(kid.keyword, path)
+            visit(kid.keyword, path, kid.attributes)
             descend(kid.keyword, path .. KeywordTree.SEPARATOR)
         end
     end
@@ -121,8 +185,8 @@ end
 function KeywordTree.findByName(catalog, name)
     local folded = KeywordTree.fold(name)
     local matches = {}
-    KeywordTree.walk(catalog, nil, function(keyword, path)
-        if KeywordTree.fold(keyword:getName()) == folded then
+    KeywordTree.walk(catalog, nil, function(keyword, path, attributes)
+        if KeywordTree.fold(attributes.keywordName or keyword:getName()) == folded then
             matches[#matches + 1] = { keyword = keyword, path = path }
         end
     end)

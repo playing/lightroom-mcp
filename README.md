@@ -116,7 +116,7 @@ npx -y @mskalski/lightroom-mcp install-plugin
    xattr -d com.apple.quarantine ~/Downloads/lightroom-mcp-darwin-arm64
    ```
 
-3. Install the Lightroom plugin:
+3. Download `LightroomMCP-macos.lrplugin.zip` (or `LightroomMCP-windows.lrplugin.zip`) from the same release and extract it next to the binary, so the `LightroomMCP.lrplugin` folder sits beside it. Then install the Lightroom plugin:
    ```bash
    ~/Downloads/lightroom-mcp-darwin-arm64 install-plugin
    ```
@@ -165,8 +165,9 @@ If you'd rather drop the plugin in by hand:
 | `set_location` | Set the IPTC location (sublocation, city, state, country, ISO code) of photos. |
 | `set_metadata` | Set title, caption, headline, creator and copyright fields of photos. |
 | `list_collections` | All collections and collection sets. |
-| `create_collection` | New collection (optional parent set). |
-| `add_to_collection` | Add photos to a named collection. |
+| `create_collection` | New collection, optionally inside a collection set path (`Trips / 2026`); missing sets are created. |
+| `add_to_collection` | Add photos to a collection, by name or by its `list_collections` path. |
+| `get_collection_photos` | Photos in a collection, regular or smart (paginated). |
 | `remove_from_collection` | Remove photos from a collection (they stay in the catalog). |
 | `delete_collection` | Delete a collection (its photos stay in the catalog). |
 | `set_keywords` | Add or remove keywords on photos, by name or by hierarchy path (`Places\|Europe\|Paris`). |

@@ -59,7 +59,20 @@ Already using Claude Code, Codex, Cursor, Windsurf, or VS Code? Pick your tool b
 <details>
 <summary><b>Claude Code</b></summary>
 
-Same `.mcpb` file as Claude Desktop above — Claude Code accepts it too. Or install via the CLI:
+Load the Claude plugin from a checkout to get the MCP server and the bundled skill together:
+
+```bash
+git clone https://github.com/Automaat/lightroom-mcp.git
+claude --plugin-dir ./lightroom-mcp
+```
+
+Use `/plugin` to check that `lightroom` is loaded. The skill is available as
+`/lightroom:raw-photo-lightroom-preset`. Node.js is required: the plugin starts
+the published npm server with `npx`. That package includes the Lua bundle and
+installs it on first start when no Lightroom MCP plug-in is already installed.
+Restart Lightroom and click **Start Server** in Plug-in Manager.
+
+The same `.mcpb` file as Claude Desktop also works. To install only the MCP server:
 
 ```bash
 claude mcp add lightroom -- npx -y @mskalski/lightroom-mcp
@@ -157,7 +170,7 @@ If you'd rather drop the plugin in by hand:
 
 | Tool | What it does |
 | --- | --- |
-| `search_photos` | Search by filename / keywords / rating / date range. |
+| `search_photos` | Search by filename, keywords, rating, date, camera, lens, ISO, focal length (mm), flag, color label, edited status, file type or folder; filters intersect. |
 | `get_selected_photos` | Photos selected in Lightroom (or filmstrip). |
 | `get_photo_metadata` | Keywords (names and full paths), EXIF, GPS, IPTC location, copyright + develop settings for one photo. |
 | `get_photo_preview` | JPEG preview of one photo (raw files too), returned as an image. |
@@ -175,6 +188,7 @@ If you'd rather drop the plugin in by hand:
 | `rename_keyword` | Rename a keyword everywhere it is used. |
 | `set_rating` | Set 0-5 star rating on photos. |
 | `set_flag` | Flag photos as pick or reject, or remove the flag. |
+| `set_color_label` | Set a red, yellow, green, blue or purple label, or clear it. |
 | `import_photos` | Import a file or folder into the catalog. |
 | `export_photos` | Export with format / quality / dimensions. Set `include_location_metadata: true` explicitly to retain GPS/location in rendered exports. |
 | `export_photo_metadata` | Write metadata (incl. keyword paths) for many photos, or the selection, to a JSON file. |
@@ -183,9 +197,35 @@ If you'd rather drop the plugin in by hand:
 | `compare_develop_presets` | Diff an approved historical preset against a candidate. |
 | `create_develop_preset` | Capture explicit settings from a photo as a versioned plugin checkpoint. |
 | `export_develop_preset` | Copy a custom/checkpoint preset backing file without overwriting. |
-| `apply_develop_preset` | Apply an exact preset by UUID or disambiguated name. |
-| `copy_develop_settings` | Copy develop settings between photos. |
+| `apply_develop_preset` | Apply an exact preset by UUID or disambiguated name; recomputes AI masks per photo (LrC 13.3+). |
+| `copy_develop_settings` | Copy develop settings between photos; recomputes copied AI masks per photo (LrC 13.3+). |
 | `set_develop_settings` | Write SDK setting key/values directly. |
+| `list_develop_snapshots` | List a photo’s saved develop snapshots. |
+| `create_develop_snapshot` | Save current develop settings; set `replace` to update an existing name. |
+| `apply_develop_snapshot` | Restore a saved develop snapshot. |
+| `delete_develop_snapshot` | Delete one saved develop snapshot. |
+| `apply_auto_adjustments` | Apply Lightroom Auto Tone, Auto White Balance, or both, restoring the Develop view afterwards. |
+| `apply_denoise` | Turn on AI Denoise at an amount (LrC 15+); drives the Develop module photo by photo. |
+| `list_masks` | List a photo's masks with their ids, names, hidden state and component tools, and the stored range of each range mask tool, including the color sample's l, a and b (LrC 11+); briefly opens the photo in Develop. |
+| `create_gradient_mask` | Place a linear or radial gradient mask from normalized image coordinates, as a new mask or a component of one; guarded write, LrC 15.6 only; briefly opens the photo in Develop. |
+| `update_gradient_mask` | Move or reshape an existing linear or radial gradient by tool id; same guarded write. |
+| `create_brush_mask` | Paint a brush mask from strokes (points in normalized image coordinates, radius, flow, feather, density, erase), as a new mask or a component of one; guarded write, LrC 15.6 only; briefly opens the photo in Develop. |
+| `add_brush_strokes` | Paint more strokes into an existing brush by tool id; same guarded write. |
+| `create_range_mask` | Create a luminance, color or depth range mask (one color sample point given as Lightroom's own l, a and b, which `list_masks` reads from a color range made in Lightroom, not as sRGB, or copied from an existing color range with `copy_sample_from`; depth needs a photo with device depth such as an iPhone Portrait HEIC), as a new mask or an add/subtract component of one; guarded write, LrC 15.6 only; briefly opens the photo in Develop. |
+| `delete_masks` | Delete masks or component tools by id, or all masks, from a photo (LrC 11+); an unknown id deletes nothing; briefly opens the photo in Develop. |
+| `delete_empty_masks` | Delete all empty masks from many photos and report how many photos changed (LrC 14+); no Develop switch. |
+| `set_mask_adjustments` | Change any subset of a mask's local sliders (`local_Exposure`, `local_Contrast`, ...) by mask id; out-of-range values are rejected before anything is written (LrC 11+); briefly opens the photo in Develop. |
+| `get_mask_adjustments` | Read a mask's current local slider values by mask id (LrC 11+); briefly opens the photo in Develop. |
+| `invert_mask` | Invert a mask by id, in place or as an inverted copy that keeps the original (LrC 11.4+); briefly opens the photo in Develop. |
+| `create_mask` | Create a Subject, Sky or Background mask with optional local adjustments and get its id (LrC 11+); briefly opens the photo in Develop. |
+| `create_mask_batch` | Add the same Subject, Sky or Background mask with the same adjustments to up to 200 photos, each mask recomputed for its own photo; opens only the first photo in Develop; guarded write, LrC 15.6 only. |
+| `create_people_mask` | Create People masks for chosen parts (skin, hair, eyes, lips, clothes, ...) covering all people, and get their ids; one person cannot be chosen; guarded write, LrC 15.6 only; no Develop switch; fails and leaves nothing if there is no person or part. |
+| `create_landscape_mask` | Create Landscape masks for chosen categories (sky, water, vegetation, mountains, ...) and get their ids; same guarded write and no-leftover rule; no Develop switch. |
+| `set_mask_curves` | Set a mask's local tone curve per channel (main, red, green, blue) by mask id (LrC 12.3+); briefly opens the photo in Develop. |
+| `get_mask_curves` | Read a mask's local tone curve per channel by mask id (LrC 12.3+); briefly opens the photo in Develop. |
+| `edit_mask_point_colors` | Add, update, delete or clear a mask's local Point Color swatches by mask id (LrC 13.2+); briefly opens the photo in Develop. |
+| `get_mask_point_colors` | Read a mask's local Point Color swatches by mask id (LrC 13.2+); briefly opens the photo in Develop. |
+| `combine_mask` | Add, subtract or intersect a Subject, Sky or Background component on an existing mask by id and get the component's id (LrC 11+); briefly opens the photo in Develop. |
 
 Full schemas and parameter docs: [`server/src/list-tools-handler.ts`](server/src/list-tools-handler.ts).
 
@@ -219,6 +259,32 @@ curve must start at input 0 and end at input 255.
   }
 }
 ```
+
+## Scope, write safety and limits
+
+### Your local Classic catalog
+
+This server works with the catalog open in Lightroom Classic on your computer through a Lightroom plug-in. Use it to organize photos, adjust edits and masks, and export Lightroom-rendered images. Lightroom Classic must be running. See [How it works](#how-it-works) for the connection and [Security](#security) for local access and authentication.
+
+### Safeguards when changing photos
+
+- Deleting a collection with `delete_collection` keeps its photos in the catalog ([collection handler](plugin/LightroomMCP.lrplugin/HandlerCollections.lua)).
+- Mask tools that write Lightroom's undocumented mask format check the Lightroom version, the photo's process version and the format of existing masks before writing. They read the result back and attempt to restore the previous masks if it differs; an unconfirmed restoration is reported as an error. These checks live in [GuardedMaskWrite.lua](plugin/LightroomMCP.lrplugin/GuardedMaskWrite.lua). They apply to those mask writes, not to every edit.
+- Connections require the local token described in [Security](#security), checked by [PluginInfoProvider.lua](plugin/LightroomMCP.lrplugin/PluginInfoProvider.lua).
+
+### What Lightroom's plug-in SDK does not expose
+
+The SDK is Adobe's interface for plug-ins. Its [reference](https://lrc.mcor.dev/) provides no documented calls for these operations:
+
+- Reading histogram values, individual pixel data or detected face regions. `get_photo_preview` returns a rendered image for visual inspection.
+- Running an HDR or panorama merge; producing a print or book; creating or editing a slideshow. The SDK does support [slideshow playback](https://lrc.mcor.dev/modules/LrSlideshow.html), but this server has no playback tool.
+- Running Super Resolution or Raw Details through a documented call.
+- Stack create or unstack operations on photos already in the catalog, or auto-stacking. The SDK's import operation can add a new photo to a stack.
+- Folder create, move or delete operations in the catalog, or catalog open or close operations. Importing photos and managing collections are separate operations.
+- Spot creation with the healing tools; Assisted Culling; Dust Removal; or Render to DNG.
+- Running an HTTP server inside the plug-in. The connection uses the SDK's sockets instead; see [How it works](#how-it-works).
+
+Pixel-based AI edits have another limit: copying a table of develop settings does not copy their generated image data. Since Lightroom Classic 15.0, Lightroom stores heavy edits, including AI edits, in [`.acr` sidecars when saving metadata to files](https://helpx.adobe.com/lightroom-classic/help/create-xmp-acr-files.html). Copying develop-settings tables alone does not transfer those sidecar contents.
 
 ## How it works
 
@@ -288,6 +354,7 @@ Repo layout:
 ## Troubleshooting
 
 - **`failed to open localhost:58763` after Reload Plug-in** — old async task still owns the port. Quit Lightroom (Cmd+Q on macOS / Alt+F4 on Windows) and reopen.
+- **Server not running right after Lightroom starts** — Lightroom Classic runs the plugin's start-up script only once its window is first brought to the front, even with `LrForceInitPlugin`. Seen on LrC 15.6 macOS: launched in the background (`open -g`), the plugin did nothing for 90 s and started the moment the window was activated. A Lightroom opened hidden (a login item set to hide, `open -g`, a script) therefore has no server until you switch to it once. The plugin log shows `Plugin initialized, auto-start on` when the script runs.
 - **Plugin not connected** — the server now self-restarts after a Reload Plug-in that tore down a running instance. If it's still stopped, click **Start Server** in Plug-in Manager; it reconnects within ~1s.
 - **Lightroom hangs on "performing shutdown tasks" when quitting**, or warns that "a shutdown task for the plug-in became unresponsive" — fixed by removing the plugin's shutdown hooks. `LrShutdownApp` requires the script to return a table whose `LrShutdownFunction` calls Lightroom's `doneFunction`; without it Lightroom waits out a no-progress timeout on every quit, and even with it the shutdown dialog still costs about a second. The hooks bought nothing: Lightroom cancels the plugin's function context on quit, disable and reload, and that cleanup handler already closes both ports. Measured on macOS: 7.7 s with the hooks, 0.1 s without. If a future change needs work done at quit, re-register `LrShutdownApp` and return that table.
 - **Timeout errors** — handler may be scanning a large catalog without filters; add `rating`, `filename`, `keywords`, or date filters to narrow.

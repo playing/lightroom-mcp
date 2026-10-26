@@ -30,7 +30,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '24.22.0'
+          node-version: '24.22.1'
           cache: npm
           cache-dependency-path: server/package-lock.json
 
@@ -49,6 +49,10 @@ jobs:
       - name: Test
         run: npm run test:coverage -- --ci --reporters=default
 
+      - name: Live kit tests
+        working-directory: .
+        run: node --test "tests/e2e/live/unit/*.test.mjs"
+
       - name: Upload build artifacts
         if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -66,7 +70,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '24.22.0'
+          node-version: '24.22.1'
 
       - name: Assert all version sources agree
         run: node scripts/bump-version.mjs --check

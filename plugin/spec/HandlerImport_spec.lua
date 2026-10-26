@@ -49,6 +49,24 @@ local function setup(opts)
 end
 
 describe("HandlerImport.importPhotos", function()
+    it("cancel keeps imports already committed and returns unprocessed paths", function()
+        local catalog, Handler = setup({ fs = {
+            directories = { ["/dir"] = true },
+            dirContents = { "/dir/a.jpg", "/dir/b.jpg", "/dir/c.jpg" },
+        } })
+        local context = {
+            isCanceled = function() return #catalog:getAllPhotos() >= 1 end,
+            report = function() end,
+        }
+
+        local r = Handler.importPhotos({ source_path = "/dir" }, context)
+
+        assert.are.equal(1, r.imported)
+        assert.is_false(r.complete)
+        assert.are.same({ "/dir/b.jpg", "/dir/c.jpg" }, r.remaining_paths)
+        assert.are.equal(1, #catalog:getAllPhotos())
+    end)
+
     it("imports a single photo", function()
         local catalog, Handler = setup({
             fs = { exists = { ["/photo.jpg"] = true }, directories = {} },
@@ -106,6 +124,60 @@ describe("HandlerImport.importPhotos", function()
 
         assert.is_true(r.success)
         assert.are.equal(3, r.imported)
+    end)
+
+    it("imports camera raw formats beyond Canon, Nikon and Sony, in any case", function()
+        local _, Handler = setup({
+            fs = {
+                exists = { ["/dir"] = true },
+                directories = { ["/dir"] = true },
+                dirContents = {
+                    "/dir/a.RAF", "/dir/b.CR3", "/dir/c.orf", "/dir/d.rw2", "/dir/e.pef",
+                    "/dir/f.srw", "/dir/g.3fr", "/dir/h.iiq", "/dir/i.HEIC", "/dir/j.hif",
+                },
+            },
+        })
+
+        local r = Handler.importPhotos({ source_path = "/dir" })
+
+        assert.are.equal(10, r.imported)
+        assert.are.equal(0, r.skipped)
+        assert.is_nil(r.skipped_by_extension)
+        assert.are.equal("Imported 10 photos", r.message)
+    end)
+
+    it("reports the files it skipped by extension", function()
+        local _, Handler = setup({
+            fs = {
+                exists = { ["/dir"] = true },
+                directories = { ["/dir"] = true },
+                dirContents = { "/dir/a.raf", "/dir/a.xmp", "/dir/b.xmp", "/dir/notes.txt", "/dir/README" },
+            },
+        })
+
+        local r = Handler.importPhotos({ source_path = "/dir" })
+
+        assert.are.equal(1, r.imported)
+        assert.are.equal(4, r.skipped)
+        assert.are.same({ xmp = 2, txt = 1, [""] = 1 }, r.skipped_by_extension)
+        assert.are.equal(
+            "Imported 1 photos; skipped 4 files with unsupported extensions ((none): 1, txt: 1, xmp: 2)",
+            r.message)
+    end)
+
+    it("names the skipped extensions when a folder has no importable photos", function()
+        local _, Handler = setup({
+            fs = {
+                exists = { ["/dir"] = true },
+                directories = { ["/dir"] = true },
+                dirContents = { "/dir/clip.mov", "/dir/clip.xmp" },
+            },
+        })
+
+        local ok, err = pcall(Handler.importPhotos, { source_path = "/dir" })
+
+        assert.is_false(ok)
+        assert.truthy(tostring(err):find("skipped files by extension: mov: 1, xmp: 1", 1, true))
     end)
 
     it("acquires catalog write access per photo, not once for the batch", function()

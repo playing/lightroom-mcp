@@ -2,8 +2,68 @@ import { describe, it, expect, afterEach } from '@jest/globals';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createMcpServer } from '../src/create-server.js';
-import type { PluginResponse } from '../src/dispatcher.js';
-import { TOOL_CONTRACTS } from '../src/tool-contracts.js';
+import type { CallOptions, PluginResponse } from '../src/dispatcher.js';
+
+const TOOL_CLASSES: Record<string, 'read-only' | 'additive' | 'destructive'> = {
+  create_virtual_copy: 'additive',
+  set_color_adjustments: 'destructive',
+  search_photos: 'read-only',
+  get_selected_photos: 'read-only',
+  get_photo_metadata: 'read-only',
+  get_photo_preview: 'read-only',
+  set_gps: 'destructive',
+  set_location: 'destructive',
+  set_metadata: 'destructive',
+  list_collections: 'read-only',
+  create_collection: 'additive',
+  add_to_collection: 'additive',
+  get_collection_photos: 'read-only',
+  remove_from_collection: 'destructive',
+  delete_collection: 'destructive',
+  set_keywords: 'destructive',
+  list_keywords: 'read-only',
+  rename_keyword: 'destructive',
+  set_rating: 'destructive',
+  set_flag: 'destructive',
+  set_color_label: 'destructive',
+  import_photos: 'additive',
+  export_photos: 'destructive',
+  export_photo_metadata: 'destructive',
+  list_develop_presets: 'read-only',
+  get_develop_preset: 'read-only',
+  compare_develop_presets: 'read-only',
+  create_develop_preset: 'additive',
+  export_develop_preset: 'additive',
+  apply_develop_preset: 'destructive',
+  copy_develop_settings: 'destructive',
+  set_develop_settings: 'destructive',
+  list_develop_snapshots: 'read-only',
+  create_develop_snapshot: 'destructive',
+  apply_develop_snapshot: 'destructive',
+  delete_develop_snapshot: 'destructive',
+  apply_denoise: 'destructive',
+  apply_auto_adjustments: 'destructive',
+  list_masks: 'read-only',
+  create_gradient_mask: 'destructive',
+  update_gradient_mask: 'destructive',
+  create_brush_mask: 'additive',
+  add_brush_strokes: 'destructive',
+  create_range_mask: 'destructive',
+  delete_masks: 'destructive',
+  delete_empty_masks: 'destructive',
+  set_mask_adjustments: 'destructive',
+  get_mask_adjustments: 'read-only',
+  invert_mask: 'destructive',
+  create_mask: 'additive',
+  create_mask_batch: 'additive',
+  create_people_mask: 'additive',
+  create_landscape_mask: 'additive',
+  set_mask_curves: 'destructive',
+  get_mask_curves: 'read-only',
+  edit_mask_point_colors: 'destructive',
+  get_mask_point_colors: 'read-only',
+  combine_mask: 'destructive',
+};
 
 interface ToolResult {
   content: Array<{ type: string; text: string }>;
@@ -14,7 +74,7 @@ function asToolResult(r: unknown): ToolResult {
   return r as ToolResult;
 }
 
-type CallFn = (action: string, params: unknown) => Promise<PluginResponse>;
+type CallFn = (action: string, params: unknown, timeout?: number, options?: CallOptions) => Promise<PluginResponse>;
 
 interface Pair {
   server: ReturnType<typeof createMcpServer>;
@@ -45,11 +105,90 @@ describe('createMcpServer', () => {
     }
   });
 
+
+  it('sends progress to the connected client without resolving the tool early', async () => {
+    pair = await connect({ call: async (_action, _params, _timeout, options) => {
+      options?.onProgress?.({ progress: 1, total: 2, message: 'a.jpg' });
+      options?.onProgress?.({ progress: 2, total: 2, message: 'b.jpg' });
+      return { id: '1', result: { exported: 2 } };
+    } });
+    const progress: unknown[] = [];
+
+    const result = asToolResult(await pair.client.callTool({ name: 'export_photos', arguments: {
+      photo_ids: ['1', '2'], destination: '/out',
+    } }, undefined, { onprogress: (value) => progress.push(value) }));
+
+    expect(progress).toEqual([
+      { progress: 1, total: 2, message: 'a.jpg' },
+      { progress: 2, total: 2, message: 'b.jpg' },
+    ]);
+    expect(JSON.parse(result.content[0].text)).toEqual({ exported: 2 });
+  });
+
+  it('no progressToken leaves the result unchanged and requests no progress', async () => {
+    let reporting = true;
+    pair = await connect({ call: async (_action, _params, _timeout, options) => {
+      reporting = options?.onProgress !== undefined;
+      return { id: '1', result: { exported: 2 } };
+    } });
+
+    const result = asToolResult(await pair.client.callTool({ name: 'export_photos', arguments: {
+      photo_ids: ['1', '2'], destination: '/out',
+    } }));
+
+    expect(reporting).toBe(false);
+    expect(JSON.parse(result.content[0].text)).toEqual({ exported: 2 });
+  });
+
+  it('forwards client cancel to the running dispatcher request', async () => {
+    let entered: () => void = () => {};
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let cancelled: () => void = () => {};
+    const stopped = new Promise<void>((resolve) => { cancelled = resolve; });
+    pair = await connect({ call: async (_action, _params, _timeout, options) => {
+      entered();
+      await new Promise<void>((resolve) => options?.signal?.addEventListener('abort', () => {
+        cancelled(); resolve();
+      }, { once: true }));
+      return { id: '1', result: { complete: false } };
+    } });
+    const controller = new AbortController();
+    const pending = pair.client.callTool({ name: 'export_photos', arguments: {
+      photo_ids: ['1', '2'], destination: '/out',
+    } }, undefined, { signal: controller.signal });
+    const rejection = expect(pending).rejects.toThrow();
+
+    await started;
+    controller.abort();
+
+    await stopped;
+    await rejection;
+  });
+
   describe('ListTools', () => {
-    it('returns every tool contract', async () => {
+    it('exposes tool annotations and titles for every classified tool', async () => {
       pair = await connect();
       const { tools } = await pair.client.listTools();
-      expect(tools).toHaveLength(TOOL_CONTRACTS.length);
+      expect(tools.map((tool) => tool.name).sort()).toEqual(Object.keys(TOOL_CLASSES).sort());
+      for (const tool of tools) {
+        const classification = TOOL_CLASSES[tool.name];
+        expect({ name: tool.name, title: tool.title }).toEqual({
+          name: tool.name,
+          title: expect.stringMatching(/\S/),
+        });
+        expect({ name: tool.name, annotations: tool.annotations }).toEqual({
+          name: tool.name,
+          annotations: classification === 'read-only'
+            ? { readOnlyHint: true, openWorldHint: false }
+            : { readOnlyHint: false, destructiveHint: classification === 'destructive', openWorldHint: false },
+        });
+      }
+    });
+
+    it('returns all 56 tools', async () => {
+      pair = await connect();
+      const { tools } = await pair.client.listTools();
+      expect(tools).toHaveLength(58);
     });
 
     it('includes key workflow tools', async () => {
@@ -70,6 +209,27 @@ describe('createMcpServer', () => {
         expect(tool.inputSchema.type).toBe('object');
       }
     });
+  });
+
+  it('serves the bundled skill prompt with its workflow references', async () => {
+    pair = await connect({ ready: false });
+    expect(pair.client.getServerCapabilities()).toMatchObject({ prompts: {}, tools: {} });
+    const { prompts } = await pair.client.listPrompts();
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0].name).toBe('raw-photo-lightroom-preset');
+    const result = await pair.client.getPrompt({ name: prompts[0].name });
+    expect(result.messages).toEqual([{
+      role: 'user',
+      content: { type: 'text', text: expect.stringContaining('Judge color only from RAW files rendered by Lightroom/Camera Raw.') },
+    }]);
+    expect(result.messages[0].content).toMatchObject({
+      text: expect.stringContaining('# RAW-First Lightroom Workflow v2'),
+    });
+  });
+
+  it('rejects an unknown skill prompt', async () => {
+    pair = await connect();
+    await expect(pair.client.getPrompt({ name: 'unknown' })).rejects.toThrow('Unknown prompt: unknown');
   });
 
   describe('CallTool — connection gate', () => {

@@ -2,7 +2,8 @@
   "manifest_version": "0.3",
   "name": "lightroom-mcp",
   "display_name": "Lightroom Classic",
-  "version": "0.24.0",
+  "icon": "icon.png",
+  "version": "0.25.0",
   "description": "Bridge Claude to Adobe Lightroom Classic — search, organize, develop, export.",
   "long_description": "Connects Claude to a running Adobe Lightroom Classic instance via a bundled Lua plugin. Tools cover catalog search, virtual copies, collections, ratings, keywords, develop presets, numeric develop settings, color adjustments, import and export. The Lightroom plugin is auto-installed into Lightroom's Modules folder on first run; restart Lightroom once after install to load it.",
   "author": {
@@ -111,6 +112,10 @@
       "description": "Flag photos as pick or reject, or remove the flag."
     },
     {
+      "name": "set_color_label",
+      "description": "Set or clear color labels on photos."
+    },
+    {
       "name": "import_photos",
       "description": "Import photos into the catalog."
     },
@@ -128,19 +133,19 @@
     },
     {
       "name": "get_develop_preset",
-      "description": "Read one exact Develop preset and its backing-file metadata."
+      "description": "Read the settings and backing-file metadata for one exact Develop preset."
     },
     {
       "name": "compare_develop_presets",
-      "description": "Compare settings in two Develop presets."
+      "description": "Compare two Develop presets and return a deterministic per-setting diff for iterative style matching."
     },
     {
       "name": "create_develop_preset",
-      "description": "Create a versioned plugin-managed preset checkpoint."
+      "description": "Create a versioned plugin-managed Develop preset checkpoint from selected settings on one photo."
     },
     {
       "name": "export_develop_preset",
-      "description": "Export a preset backing file without overwriting existing files."
+      "description": "Copy one exact custom or plugin-managed Develop preset backing file to a destination directory."
     },
     {
       "name": "apply_develop_preset",
@@ -156,7 +161,111 @@
     },
     {
       "name": "set_color_adjustments",
-      "description": "Set HSL, Color Grading, and Calibration adjustments on a photo."
+      "description": "Set structured HSL, Color Grading and Calibration adjustments on a photo."
+    },
+    {
+      "name": "list_develop_snapshots",
+      "description": "List saved develop snapshots for a photo"
+    },
+    {
+      "name": "create_develop_snapshot",
+      "description": "Save current develop settings as a named snapshot"
+    },
+    {
+      "name": "apply_develop_snapshot",
+      "description": "Restore saved develop settings from a snapshot"
+    },
+    {
+      "name": "delete_develop_snapshot",
+      "description": "Delete one saved develop snapshot"
+    },
+    {
+      "name": "apply_auto_adjustments",
+      "description": "Apply Lightroom Auto Tone, Auto White Balance, or both to photos."
+    },
+    {
+      "name": "apply_denoise",
+      "description": "Turn on AI Denoise at a given amount on photos."
+    },
+    {
+      "name": "list_masks",
+      "description": "List the masks on a photo with their ids, names, component tools and stored ranges."
+    },
+    {
+      "name": "create_gradient_mask",
+      "description": "Place a linear or radial gradient mask on a photo from normalized image coordinates."
+    },
+    {
+      "name": "update_gradient_mask",
+      "description": "Move or reshape an existing linear or radial gradient mask by tool id."
+    },
+    {
+      "name": "create_brush_mask",
+      "description": "Paint a brush mask on a photo from strokes of normalized image coordinates (radius, flow, feather, density, erase)."
+    },
+    {
+      "name": "add_brush_strokes",
+      "description": "Paint more strokes into an existing brush mask by tool id (radius, flow, feather, density, erase)."
+    },
+    {
+      "name": "create_range_mask",
+      "description": "Create a luminance, color or depth range mask on a photo, as a new mask or a component of one."
+    },
+    {
+      "name": "delete_masks",
+      "description": "Delete masks, or component tools of masks, from a photo by id, or all masks on it."
+    },
+    {
+      "name": "delete_empty_masks",
+      "description": "Delete all empty masks from a list of photos."
+    },
+    {
+      "name": "set_mask_adjustments",
+      "description": "Change local adjustment sliders on an existing mask of a photo."
+    },
+    {
+      "name": "get_mask_adjustments",
+      "description": "Read the current local adjustment values of a mask on a photo."
+    },
+    {
+      "name": "invert_mask",
+      "description": "Invert a mask on a photo in place, or create an inverted copy of it."
+    },
+    {
+      "name": "create_mask",
+      "description": "Create a Subject, Sky or Background mask on a photo, with optional local adjustments."
+    },
+    {
+      "name": "create_mask_batch",
+      "description": "Add the same Subject, Sky or Background mask to many photos, each recomputed for its own photo."
+    },
+    {
+      "name": "create_people_mask",
+      "description": "Create People masks for chosen parts such as skin, hair, eyes, lips or clothes, covering all people."
+    },
+    {
+      "name": "create_landscape_mask",
+      "description": "Create Landscape masks for chosen categories such as sky, water, vegetation or mountains."
+    },
+    {
+      "name": "set_mask_curves",
+      "description": "Set the local tone curve of a mask on a photo, per channel."
+    },
+    {
+      "name": "get_mask_curves",
+      "description": "Read the local tone curve of a mask on a photo."
+    },
+    {
+      "name": "edit_mask_point_colors",
+      "description": "Add, update, delete or clear the local Point Color swatches of a mask."
+    },
+    {
+      "name": "get_mask_point_colors",
+      "description": "Read the local Point Color swatches of a mask on a photo."
+    },
+    {
+      "name": "combine_mask",
+      "description": "Add, subtract or intersect a Subject, Sky or Background component on an existing mask."
     }
   ],
   "user_config": {

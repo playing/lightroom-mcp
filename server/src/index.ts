@@ -17,7 +17,7 @@ import { startHeartbeat, probePlugin } from "./heartbeat.js";
 import { PluginLiveness } from "./plugin-liveness.js";
 import { waitUntil } from "./wait-until.js";
 import { diagnoseUnresponsive, UnresponsiveReporter } from "./port-owner.js";
-import { acquireInstanceLock } from "./instance-lock.js";
+import { acquireInstanceLock, lockHolder, lockHolderUnresponsive } from "./instance-lock.js";
 import {
   ensurePluginInstalled,
   findBundledPlugin,
@@ -50,8 +50,15 @@ const ACTION_TIMEOUTS_MS: Record<string, number> = {
   export_photos: LONG_RUNNING_TIMEOUT_MS,
   export_photo_metadata: LONG_RUNNING_TIMEOUT_MS,
   import_photos: LONG_RUNNING_TIMEOUT_MS,
+  apply_denoise: LONG_RUNNING_TIMEOUT_MS,
+  apply_auto_adjustments: LONG_RUNNING_TIMEOUT_MS,
+  create_mask: LONG_RUNNING_TIMEOUT_MS,
+  create_mask_batch: LONG_RUNNING_TIMEOUT_MS,
+  combine_mask: LONG_RUNNING_TIMEOUT_MS,
   ping: PING_TIMEOUT_MS,
 };
+const SHUTDOWN_GRACE_MS = Math.max(REQUEST_TIMEOUT_MS, ...Object.values(ACTION_TIMEOUTS_MS)) + 5_000;
+const SHUTDOWN_EXIT_MARGIN_MS = 1_000;
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -94,9 +101,11 @@ async function main() {
     acquireLock: () => acquireInstanceLock(REQUEST_PORT, RESPONSE_PORT),
     startLeader: () => startLeader(REQUEST_PORT, RESPONSE_PORT),
     readToken: tryReadToken,
+    holderUnresponsive: () => lockHolderUnresponsive(REQUEST_PORT, RESPONSE_PORT),
+    lockHolder: () => lockHolder(REQUEST_PORT, RESPONSE_PORT),
   });
 
-  const server = createMcpServer({ callTool: (name, args) => bridge.callTool(name, args) });
+  const server = createMcpServer({ callTool: (name, args, options) => bridge.callTool(name, args, options) });
   server.oninitialized = () => void bridge.start();
 
   const transport = new StdioServerTransport();
@@ -109,9 +118,13 @@ async function main() {
   // the instance lock, so every future bridge instance fails with "Another
   // Lightroom MCP bridge is already running". Stdin EOF is the one reliable
   // cross-platform signal that the client is gone.
+  let shuttingDown = false;
   const exitOnClientGone = (reason: string) => () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.error(`Shutting down: ${reason}`);
-    process.exit(0);
+    setTimeout(() => process.exit(0), SHUTDOWN_GRACE_MS + SHUTDOWN_EXIT_MARGIN_MS).unref();
+    void bridge.shutdown(SHUTDOWN_GRACE_MS).finally(() => process.exit(0));
   };
   process.stdin.once("end", exitOnClientGone("stdin ended (client exited)"));
   process.stdin.once("close", exitOnClientGone("stdin closed (client exited)"));

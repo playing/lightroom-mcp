@@ -1,4 +1,5 @@
 local LrTasks = import 'LrTasks'
+local LrProgressScope = import 'LrProgressScope'
 local LrDialogs = import 'LrDialogs'
 local LrFunctionContext = import 'LrFunctionContext'
 local LrSocket = import 'LrSocket'
@@ -20,6 +21,20 @@ local HandlerSelection = require 'HandlerSelection'
 local HandlerPreview = require 'HandlerPreview'
 local HandlerDevelop = require 'HandlerDevelop'
 local HandlerVirtualCopies = require 'HandlerVirtualCopies'
+local HandlerSnapshots = require 'HandlerSnapshots'
+local HandlerMasks = require 'HandlerMasks'
+local HandlerGradientMasks = require 'HandlerGradientMasks'
+local HandlerAiMasks = require 'HandlerAiMasks'
+local HandlerBrushMasks = require 'HandlerBrushMasks'
+local HandlerRangeMasks = require 'HandlerRangeMasks'
+local HandlerMaskDelete = require 'HandlerMaskDelete'
+local HandlerMaskAdjustments = require 'HandlerMaskAdjustments'
+local HandlerMaskInvert = require 'HandlerMaskInvert'
+local HandlerMaskCurves = require 'HandlerMaskCurves'
+local HandlerMaskPointColors = require 'HandlerMaskPointColors'
+local HandlerMaskCreate = require 'HandlerMaskCreate'
+local HandlerMaskBatch = require 'HandlerMaskBatch'
+local HandlerMaskCombine = require 'HandlerMaskCombine'
 local Log = require 'Log'
 
 local DEFAULT_REQUEST_PORT = 58763
@@ -202,6 +217,7 @@ local DISPATCH = {
     rename_keyword = HandlerKeywords.renameKeyword,
     set_rating = HandlerOrganization.setRating,
     set_flag = HandlerOrganization.setFlag,
+    set_color_label = HandlerOrganization.setColorLabel,
     import_photos = HandlerImport.importPhotos,
     export_photos = HandlerExport.exportPhotos,
     export_photo_metadata = HandlerExport.exportPhotoMetadata,
@@ -218,6 +234,32 @@ local DISPATCH = {
     copy_develop_settings = HandlerDevelop.copyDevelopSettings,
     set_develop_settings = HandlerDevelop.setDevelopSettings,
     set_color_adjustments = HandlerDevelop.setColorAdjustments,
+    list_develop_snapshots = HandlerSnapshots.list,
+    create_develop_snapshot = HandlerSnapshots.create,
+    apply_develop_snapshot = HandlerSnapshots.apply,
+    delete_develop_snapshot = HandlerSnapshots.delete,
+    apply_denoise = HandlerDevelop.applyDenoise,
+    apply_auto_adjustments = HandlerDevelop.applyAutoAdjustments,
+    list_masks = HandlerMasks.listMasks,
+    create_gradient_mask = HandlerGradientMasks.createGradientMask,
+    update_gradient_mask = HandlerGradientMasks.updateGradientMask,
+    create_people_mask = HandlerAiMasks.createPeopleMask,
+    create_landscape_mask = HandlerAiMasks.createLandscapeMask,
+    create_brush_mask = HandlerBrushMasks.createBrushMask,
+    add_brush_strokes = HandlerBrushMasks.addBrushStrokes,
+    create_range_mask = HandlerRangeMasks.createRangeMask,
+    delete_masks = HandlerMaskDelete.deleteMasks,
+    delete_empty_masks = HandlerMaskDelete.deleteEmptyMasks,
+    set_mask_adjustments = HandlerMaskAdjustments.setMaskAdjustments,
+    get_mask_adjustments = HandlerMaskAdjustments.getMaskAdjustments,
+    invert_mask = HandlerMaskInvert.invertMask,
+    set_mask_curves = HandlerMaskCurves.setMaskCurves,
+    get_mask_curves = HandlerMaskCurves.getMaskCurves,
+    edit_mask_point_colors = HandlerMaskPointColors.editMaskPointColors,
+    get_mask_point_colors = HandlerMaskPointColors.getMaskPointColors,
+    create_mask = HandlerMaskCreate.createMask,
+    create_mask_batch = HandlerMaskBatch.createMaskBatch,
+    combine_mask = HandlerMaskCombine.combineMask,
 }
 
 -- Generous wait so the very first response after handshake doesn't get
@@ -297,6 +339,9 @@ local function sendResponse(response)
     pluginState.requestsProcessed = pluginState.requestsProcessed + 1
 end
 
+local activeRequests = {}
+local LONG_ACTIONS = { export_photos = true, import_photos = true, apply_denoise = true, create_mask_batch = true }
+
 local function dispatchAction(request)
     if shutdownRequested() then return end
     local id = request.id
@@ -335,9 +380,32 @@ local function dispatchAction(request)
     -- Lightroom's Lua sandbox: using them in the dispatcher's error path
     -- turns a handler error into a silent nil-call that never reaches the
     -- client. Stick to LrTasks.pcall.
+    local context
+    if LONG_ACTIONS[action] then
+        local scope = LrProgressScope { title = action, caption = "Starting" }
+        scope:setCancelable(true)
+        context = activeRequests[id] or { cancelled = false }
+        context.lastProgress = -1
+        function context:isCanceled() return self.cancelled or scope:isCanceled() end
+        function context:report(progress, total, message)
+            scope:setPortionComplete(progress, math.max(total, 1))
+            scope:setCaption(tostring(message))
+            if request.reportProgress and progress > self.lastProgress then
+                self.lastProgress = progress
+                sendResponse({ progressFor = id, progress = { progress = progress, total = total, message = tostring(message) } })
+            end
+        end
+        context.scope = scope
+        activeRequests[id] = context
+    end
     local execOk, resultOrErr = LrTasks.pcall(function()
-        return handler(params)
+        return handler(params, context)
     end)
+    activeRequests[id] = nil
+    if context then
+        if context:isCanceled() then addLog("Cancelled " .. action .. " id=" .. tostring(id)) end
+        context.scope:done()
+    end
     if execOk then
         sendResponse({ id = id, result = resultOrErr })
     else
@@ -380,6 +448,12 @@ local function consumeMessage(message)
         return nil
     end
 
+    if request.action == "cancel" then
+        local target = request.params and request.params.request_id
+        if target and activeRequests[target] then activeRequests[target].cancelled = true end
+        return nil
+    end
+    if LONG_ACTIONS[request.action] and request.id then activeRequests[request.id] = { cancelled = false } end
     return request
 end
 
@@ -431,6 +505,7 @@ local function startServer()
                 return
             end
             addLog("Server task context cleanup")
+            pluginState.running = false
             if pluginState.requestSocket then
                 pcall(function() pluginState.requestSocket:close() end)
             end
@@ -444,13 +519,15 @@ local function startServer()
             pluginState.token = nil
         end)
 
-        local function bindRequest()
+        local function bindRequest(myGen)
+            local function isLive() return pluginState.requestGen == myGen end
             return LrSocket.bind {
                 functionContext = context,
                 plugin = _PLUGIN,
                 port = requestPort,
                 mode = "receive",
                 onConnected = function()
+                    if not isLive() then return end
                     pluginState.receiveConnected = true
                     pluginState.lastConnectedTime = os.time()
                     -- A stale lastRequestTime from a prior session (e.g. user
@@ -489,11 +566,13 @@ local function startServer()
                     end
                 end,
                 onClosed = function()
+                    if not isLive() then return end
                     pluginState.receiveConnected = false
-                    pluginState.requestNeedsReconnect = true
-                    addLog("REQUEST socket closed (client disconnected)")
+                    pluginState.requestNeedsRebind = true
+                    addLog("REQUEST socket closed (gen=" .. myGen .. ")")
                 end,
                 onError = function(_, err)
+                    if not isLive() then return end
                     local errStr = tostring(err)
                     if isBindFailure(errStr) then
                         logBindFailure("REQUEST", requestPort, errStr)
@@ -504,7 +583,7 @@ local function startServer()
                         end
                     else
                         pluginState.receiveConnected = false
-                        pluginState.requestNeedsReconnect = true
+                        pluginState.requestNeedsRebind = true
                         addLog("REQUEST socket error: " .. errStr)
                     end
                 end,
@@ -521,7 +600,9 @@ local function startServer()
         -- resetForReload, or a panel Stop->Start) doesn't enter the monitor
         -- loop with a stale reconnect/rebind pending and churn the sockets we
         -- just bound on the first tick.
+        pluginState.requestGen = 0
         pluginState.requestNeedsReconnect = false
+        pluginState.requestNeedsRebind = false
         pluginState.responseNeedsRebind = false
         pluginState.responseNeedsReconnect = false
 
@@ -572,8 +653,9 @@ local function startServer()
         -- pre-existing stale callbacks from a Reload Plug-in cycle were
         -- bound against gen=0 and stay ignored).
         pluginState.responseGen = pluginState.responseGen + 1
-        pluginState.requestSocket = bindRequest()
-        addLog("REQUEST bound on " .. requestPort)
+        pluginState.requestGen = pluginState.requestGen + 1
+        pluginState.requestSocket = bindRequest(pluginState.requestGen)
+        addLog("REQUEST bound on " .. requestPort .. " gen=" .. pluginState.requestGen)
         pluginState.responseSocket = bindResponse(pluginState.responseGen)
         addLog("RESPONSE bound on " .. responsePort .. " gen=" .. pluginState.responseGen)
 
@@ -588,9 +670,26 @@ local function startServer()
                 pluginState.running = false
                 break
             end
-            if pluginState.requestNeedsReconnect and pluginState.requestSocket then
+            if pluginState.requestNeedsRebind then
+                pluginState.requestGen = pluginState.requestGen + 1
+                local newGen = pluginState.requestGen
+                if pluginState.requestSocket then
+                    pcall(function() pluginState.requestSocket:close() end)
+                end
+                pluginState.receiveConnected = false
+                LrTasks.sleep(0.1)
+                if shutdownRequested() then break end
+                pluginState.requestSocket = bindRequest(newGen)
+                pluginState.requestNeedsRebind = false
                 pluginState.requestNeedsReconnect = false
-                pluginState.requestSocket:reconnect()
+                addLog("REQUEST rebound on " .. requestPort .. " gen=" .. newGen)
+            elseif pluginState.requestNeedsReconnect and pluginState.requestSocket then
+                pluginState.requestNeedsReconnect = false
+                local reconnected, reconnectErr = LrTasks.pcall(function() pluginState.requestSocket:reconnect() end)
+                if not reconnected then
+                    addLog("REQUEST reconnect failed, rebinding: " .. tostring(reconnectErr))
+                    pluginState.requestNeedsRebind = true
+                end
             end
             -- Response socket has two recovery paths:
             -- - rebind: full close+rebind for true client disconnect
@@ -712,6 +811,7 @@ local function resetForReload()
     -- deliberately NOT reset -- it must keep advancing so a superseded
     -- instance's cleanup handler stays a no-op (see startServer).
     pluginState.requestNeedsReconnect = false
+    pluginState.requestNeedsRebind = false
     pluginState.responseNeedsRebind = false
     pluginState.responseNeedsReconnect = false
     pluginState.lastEvent = nil
@@ -729,6 +829,7 @@ local function shutdown()
     pluginState.shuttingDown = true
     pluginState.running = false
     pluginState.requestNeedsReconnect = false
+    pluginState.requestNeedsRebind = false
     pluginState.responseNeedsRebind = false
     pluginState.responseNeedsReconnect = false
     pluginState.needsFullRestart = false

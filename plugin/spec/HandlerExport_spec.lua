@@ -4,11 +4,26 @@ local function setup(opts)
     opts = opts or {}
     local exportSessionCalls = {}
     local catalog = helper.fakeCatalog({ photos = opts.photos or {} })
+    -- path -> false | "file" | "directory", as LrFileUtils.exists answers; unlisted paths are directories
+    local paths = opts.paths or {}
+    local createdDirs = {}
     helper.installImport({
         LrApplication = { activeCatalog = function() return catalog end },
         LrLogger = helper.defaultLrLogger(),
-        LrFileUtils = {},
-        LrPathUtils = {},
+        LrFileUtils = {
+            exists = function(path)
+                if paths[path] == nil then return "directory" end
+                return paths[path]
+            end,
+            createAllDirectories = function(path)
+                table.insert(createdDirs, path)
+                if not opts.createFails then paths[path] = "directory" end
+            end,
+        },
+        LrPathUtils = {
+            child = function(dir, name) return dir .. "/" .. name end,
+            getStandardFilePath = function() return "/home/u" end,
+        },
         LrExportSession = function(args)
             table.insert(exportSessionCalls, args)
             return {
@@ -17,10 +32,52 @@ local function setup(opts)
         end,
     })
     package.loaded.HandlerExport = nil
-    return catalog, require 'HandlerExport', exportSessionCalls
+    return catalog, require 'HandlerExport', exportSessionCalls, createdDirs
 end
 
 describe("HandlerExport.exportPhotos", function()
+    it("reports rising progress with the photo currently being exported", function()
+        local photos = {
+            helper.fakePhoto({ id = "1", path = "/a.jpg", fileName = "a.jpg" }),
+            helper.fakePhoto({ id = "2", path = "/b.jpg", fileName = "b.jpg" }),
+        }
+        local _, Handler, calls = setup({ photos = photos })
+        local progress = {}
+        local context = {
+            isCanceled = function() return false end,
+            report = function(_, completed, total, message)
+                progress[#progress + 1] = { completed, total, message, exported = #calls }
+            end,
+        }
+
+        Handler.exportPhotos({ photo_ids = { "1", "2" }, destination = "/out" }, context)
+
+        assert.are.same({
+            { 0, 2, "a.jpg", exported = 0 },
+            { 1, 2, "b.jpg", exported = 1 },
+            { 2, 2, "b.jpg", exported = 2 },
+        }, progress)
+    end)
+
+    it("cancel keeps finished exports and leaves later photos untouched", function()
+        local photos = {
+            helper.fakePhoto({ id = "1", path = "/a.jpg" }),
+            helper.fakePhoto({ id = "2", path = "/b.jpg" }),
+            helper.fakePhoto({ id = "3", path = "/c.jpg" }),
+            helper.fakePhoto({ id = "4", path = "/d.jpg" }),
+            helper.fakePhoto({ id = "5", path = "/e.jpg" }),
+        }
+        local _, Handler, calls = setup({ photos = photos })
+        local context = { isCanceled = function() return #calls >= 2 end, report = function() end }
+
+        local r = Handler.exportPhotos({ photo_ids = { "1", "2", "3", "4", "5" }, destination = "/out" }, context)
+
+        assert.are.equal(2, r.exported)
+        assert.is_false(r.complete)
+        assert.are.same({ "3", "4", "5" }, r.remaining_ids)
+        assert.are.equal(2, #calls)
+    end)
+
     it("exports found photos with default JPEG settings", function()
         local p = helper.fakePhoto({ id = "1", path = "/a.jpg" })
         local _, Handler, calls = setup({ photos = { p } })
@@ -31,6 +88,113 @@ describe("HandlerExport.exportPhotos", function()
         assert.are.equal(1, r.exported)
         assert.are.equal("/out", r.destination)
         assert.are.equal("JPEG", calls[1].exportSettings.LR_format)
+    end)
+
+    it("creates a missing destination folder before exporting", function()
+        local p = helper.fakePhoto({ id = "1", path = "/a.jpg" })
+        local _, Handler, calls, createdDirs = setup({ photos = { p }, paths = { ["/out/new"] = false } })
+
+        local r = Handler.exportPhotos({ photo_ids = { "1" }, destination = "/out/new" })
+
+        assert.is_true(r.success)
+        assert.are.same({ "/out/new" }, createdDirs)
+        assert.are.equal("/out/new", calls[1].exportSettings.LR_export_destinationPathPrefix)
+    end)
+
+    it("leaves an existing destination folder alone", function()
+        local p = helper.fakePhoto({ id = "1", path = "/a.jpg" })
+        local _, Handler, _, createdDirs = setup({ photos = { p } })
+
+        Handler.exportPhotos({ photo_ids = { "1" }, destination = "/out" })
+
+        assert.are.same({}, createdDirs)
+    end)
+
+    it("rejects a destination that is a file, without exporting", function()
+        local p = helper.fakePhoto({ id = "1", path = "/a.jpg" })
+        local _, Handler, calls = setup({ photos = { p }, paths = { ["/out.jpg"] = "file" } })
+
+        assert.has_error(function()
+            Handler.exportPhotos({ photo_ids = { "1" }, destination = "/out.jpg" })
+        end, "destination is not a directory: /out.jpg")
+        assert.are.equal(0, #calls)
+    end)
+
+    it("says the folder could not be created when creating it fails", function()
+        local p = helper.fakePhoto({ id = "1", path = "/a.jpg" })
+        local _, Handler, calls = setup({ photos = { p }, paths = { ["/ro/sub"] = false }, createFails = true })
+
+        assert.has_error(function()
+            Handler.exportPhotos({ photo_ids = { "1" }, destination = "/ro/sub" })
+        end, "could not create destination folder: /ro/sub")
+        assert.are.equal(0, #calls)
+    end)
+
+    it("creates no folder when another argument is rejected", function()
+        local p = helper.fakePhoto({ id = "1", path = "/a.jpg" })
+        for _, bad in ipairs({
+            { format = "gif", err = "format must be one of: jpeg, png, tiff, original" },
+            { on_existing = "bogus", err = "on_existing must be one of: rename, overwrite, skip" },
+        }) do
+            local _, Handler, calls, createdDirs = setup({ photos = { p }, paths = { ["/out/new"] = false } })
+
+            assert.has_error(function()
+                Handler.exportPhotos({
+                    photo_ids = { "1" }, destination = "/out/new", format = bad.format, on_existing = bad.on_existing,
+                })
+            end, bad.err)
+            assert.are.same({}, createdDirs)
+            assert.are.equal(0, #calls)
+        end
+    end)
+
+    it("rejects an empty, relative or control-character destination before creating anything", function()
+        local p = helper.fakePhoto({ id = "1", path = "/a.jpg" })
+        for destination, err in pairs({
+            [""] = "destination is required",
+            ["  "] = "destination is required",
+            ["relative/x"] = "destination must be an absolute path",
+            ["~x"] = "destination must be an absolute path",
+            ["/out/a\nb"] = "destination must not contain control characters",
+        }) do
+            local _, Handler, calls, createdDirs = setup({ photos = { p }, paths = { [destination] = false } })
+
+            assert.has_error(function()
+                Handler.exportPhotos({ photo_ids = { "1" }, destination = destination })
+            end, err)
+            assert.are.same({}, createdDirs)
+            assert.are.equal(0, #calls)
+        end
+    end)
+
+    it("expands a leading ~/ to the home folder", function()
+        local p = helper.fakePhoto({ id = "1", path = "/a.jpg" })
+        local _, Handler, calls, createdDirs = setup({ photos = { p }, paths = { ["/home/u/out"] = false } })
+
+        local r = Handler.exportPhotos({ photo_ids = { "1" }, destination = "~/out" })
+
+        assert.are.same({ "/home/u/out" }, createdDirs)
+        assert.are.equal("/home/u/out", calls[1].exportSettings.LR_export_destinationPathPrefix)
+        assert.are.equal("/home/u/out", r.destination)
+    end)
+
+    it("accepts only Windows absolute paths on Windows", function()
+        local p = helper.fakePhoto({ id = "1", path = "/a.jpg" })
+        local _, Handler = setup({ photos = { p } })
+        _G.WIN_ENV = true
+        local results = {}
+        for _, path in ipairs({ "C:\\out", "C:/out", "\\\\srv\\s", "C:out", "/out" }) do
+            results[path] = pcall(Handler.exportPhotos, { photo_ids = { "1" }, destination = path })
+        end
+        _G.WIN_ENV = nil
+
+        assert.are.same({
+            ["C:\\out"] = true,
+            ["C:/out"] = true,
+            ["\\\\srv\\s"] = true,
+            ["C:out"] = false,
+            ["/out"] = false,
+        }, results)
     end)
 
     it("never lets Lightroom prompt about existing files", function()
@@ -163,7 +327,7 @@ describe("HandlerExport.exportPhotos", function()
         helper.installImport({
             LrApplication = { activeCatalog = function() return catalog end },
             LrLogger = helper.defaultLrLogger(),
-            LrFileUtils = {},
+            LrFileUtils = { exists = function() return "directory" end },
             LrPathUtils = {},
             LrExportSession = function()
                 return {

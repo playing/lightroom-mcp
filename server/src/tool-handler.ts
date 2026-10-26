@@ -1,4 +1,4 @@
-import type { Dispatcher } from "./dispatcher.js";
+import type { CallOptions, Dispatcher } from "./dispatcher.js";
 import { validateToolArgs } from "./validate-args.js";
 
 export interface ToolHandlerDeps {
@@ -54,10 +54,13 @@ function successContent(result: unknown): ToolResponse["content"] {
 }
 
 export const NOT_CONNECTED_MESSAGE =
-  "Lightroom plugin not connected. Open Lightroom and click 'Start Server' in Plug-in Manager.";
+  "Lightroom plugin not connected. If Lightroom is already open, bring its window to the front once: " +
+  "Lightroom starts plug-ins only after its window is first activated, so a Lightroom launched hidden or " +
+  "in the background has not started the server yet. Otherwise open Lightroom and click 'Start Server' " +
+  "in Plug-in Manager.";
 
 export function createCallToolHandler(deps: ToolHandlerDeps) {
-  return async (name: string, args: unknown): Promise<ToolResponse> => {
+  return async (name: string, args: unknown, options?: CallOptions): Promise<ToolResponse> => {
     const invalid = validateToolArgs(name, args);
     if (invalid) {
       return {
@@ -76,7 +79,9 @@ export function createCallToolHandler(deps: ToolHandlerDeps) {
     }
 
     try {
-      const resp = await deps.dispatcher.call(name, args);
+      const resp = options
+        ? await deps.dispatcher.call(name, args, undefined, options)
+        : await deps.dispatcher.call(name, args);
       if (resp.error) {
         return {
           content: [{ type: "text", text: `Error: ${resp.error}` }],

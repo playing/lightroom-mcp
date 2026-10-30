@@ -46,7 +46,7 @@ class McpClient {
   async start() {
     this.proc = spawn("node", [SERVER_BIN], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env },
+      env: { ...process.env, LIGHTROOM_MCP_TOOLSETS: "all" },
     });
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
@@ -293,7 +293,7 @@ async function main() {
     const destinationDir = path.join(outputRoot, checkpointName);
 
     await run("find a source photo without changing it", async () => {
-      const r = await c.callTool("search_photos", { limit: 1 });
+      const r = await c.callTool("search_photos", { limit: 1, include_path: true });
       checkTrue("not error", !r.isError, r.text);
       ctx.firstPhoto = r.parsed.photos?.[0];
       checkTrue("photo exists", !!ctx.firstPhoto, "catalog appears empty");
@@ -366,9 +366,9 @@ async function main() {
   }
 
   if (mode === "read" || mode === "all") {
-    await run("tools/list returns 50 tools", async () => {
+    await run("tools/list returns 74 tools", async () => {
       const tools = await c.listTools();
-      checkEq("tool count", tools.tools.length, 50);
+      checkEq("tool count", tools.tools.length, 74);
     });
 
     await run("list_collections smoke", async () => {
@@ -404,6 +404,7 @@ async function main() {
       if (!ctx.firstPhoto) throw new Error("no photo to test against");
       const r = await c.callTool("get_photo_metadata", {
         photo_id: String(ctx.firstPhoto.id),
+        sections: ["developSettings"],
       });
       checkTrue("not error", !r.isError, r.text);
       checkTrue("has filename", typeof r.parsed.filename === "string");
@@ -422,6 +423,9 @@ async function main() {
       const r = await c.callTool("list_develop_presets", {});
       checkTrue("not error", !r.isError, r.text);
       checkTrue("count is number", typeof r.parsed.count === "number");
+      checkTrue("page is bounded", r.parsed.presets.length <= 100);
+      checkEq("has_more matches total", r.parsed.has_more, r.parsed.presets.length < r.parsed.count);
+      checkTrue("list omits backing files", r.parsed.presets.every((preset) => !("file" in preset)));
       ctx.presets = r.parsed.presets;
       ctx.exactPresets = r.parsed.presets.filter((preset) =>
         exactPresetSelector(preset, r.parsed.presets));
@@ -485,8 +489,8 @@ async function main() {
       });
 
       const originalRating = ctx.firstPhoto.rating ?? 0;
-      await run("set_rating to 3", async () => {
-        const r = await c.callTool("set_rating", {
+      await run("set_rating_and_flag to 3", async () => {
+        const r = await c.callTool("set_rating_and_flag", {
           photo_ids: [String(ctx.firstPhoto.id)],
           rating: 3,
         });
@@ -501,8 +505,8 @@ async function main() {
         checkEq("rating", r.parsed.rating, 3);
       });
 
-      await run(`set_rating restore to ${originalRating}`, async () => {
-        const r = await c.callTool("set_rating", {
+      await run(`set_rating_and_flag restore to ${originalRating}`, async () => {
+        const r = await c.callTool("set_rating_and_flag", {
           photo_ids: [String(ctx.firstPhoto.id)],
           rating: originalRating,
         });
@@ -568,6 +572,7 @@ async function main() {
         checkTrue("first not error", !r1.isError, r1.text);
         const meta = await c.callTool("get_photo_metadata", {
           photo_id: String(ctx.firstPhoto.id),
+          sections: ["developSettings"],
         });
         checkTrue("exposure ~0.5", Math.abs((meta.parsed.developSettings.exposure ?? 0) - 0.5) < 1e-6,
           `got ${meta.parsed.developSettings.exposure}`);
@@ -613,6 +618,7 @@ async function main() {
         checkEq("copied", cp.parsed.copied, 1);
         const dstMeta = await c.callTool("get_photo_metadata", {
           photo_id: String(dst.id),
+          sections: ["developSettings"],
         });
         checkEq("dst contrast", dstMeta.parsed.developSettings.contrast, 42);
         // restore source
@@ -632,9 +638,9 @@ async function main() {
     // Phase 7b — export to /tmp, verify file + dimensions.
     // Prefer a real photo (rating>=1 typically means actual catalog content,
     // skipping test fixtures like synthetic PNGs that LR refuses to render).
-    let search = await c.callTool("search_photos", { rating: 5, limit: 1 });
+    let search = await c.callTool("search_photos", { rating: 5, limit: 1, include_path: true });
     if (search.isError || !search.parsed.photos?.length) {
-      search = await c.callTool("search_photos", { limit: 1 });
+      search = await c.callTool("search_photos", { limit: 1, include_path: true });
     }
     const photo = search.parsed.photos?.[0];
     if (photo) {
@@ -711,8 +717,8 @@ async function main() {
       checkEq("isError", r.isError, true);
     });
 
-    await run("set_rating out-of-range returns isError", async () => {
-      const r = await c.callTool("set_rating", { photo_ids: ["1"], rating: 9 });
+    await run("set_rating_and_flag out-of-range returns isError", async () => {
+      const r = await c.callTool("set_rating_and_flag", { photo_ids: ["1"], rating: 9 });
       checkEq("isError", r.isError, true);
     });
 

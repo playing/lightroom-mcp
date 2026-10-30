@@ -32,6 +32,7 @@ local function setup(photos, onSleep)
         LrLogger = helper.defaultLrLogger(),
         LrStringUtils = { encodeBase64 = function(s) return "b64(" .. s .. ")" end },
         LrTasks = {
+            pcall = pcall,
             sleep = function(seconds)
                 sleeps.count = sleeps.count + 1
                 sleeps.now = sleeps.now + seconds
@@ -44,6 +45,33 @@ local function setup(photos, onSleep)
 end
 
 describe("HandlerPreview.getPhotoPreview", function()
+    it("reads duplicate capture seconds raw and opens no write gate", function()
+        local photo = previewPhoto({ id = "1", path = "/a.nef", dateTimeOriginal = 12345 },
+            function(_, _, _, cb) cb("JPEGDATA") end)
+        photo.getFormattedMetadata = function() error("formatted capture time must not be read") end
+        local catalog, Handler = setup({ photo })
+        catalog.withWriteAccessDo = function() error("duplicate grouping must not write") end
+        local first = Handler.findDuplicateGroups({ photo_ids = { "1" } })
+        photo.getRawMetadata = function(_, key)
+            if key == "dateTimeOriginal" then return 12346 end
+            if key == "uuid" then return "uuid-1" end
+        end
+        local second = Handler.findDuplicateGroups({ photo_ids = { "1" } })
+        assert.are.equal(1, second.capture_time - first.capture_time)
+        assert.are.equal(64, first.requested_size)
+    end)
+
+    it("supplies a statistics preview without changing the catalog", function()
+        local photo = previewPhoto({ id = "1", path = "/a.nef" }, function(_, _, _, cb) cb("JPEGDATA") end)
+        local _, Handler = setup({ photo })
+
+        local r = Handler.getPhotoStats({ photo_ids = { "1" } })
+
+        assert.are.equal("1", r.photo_id)
+        assert.are.equal(512, r.requested_size)
+        assert.are.same({ mime_type = "image/jpeg", data = "b64(JPEGDATA)" }, r.image)
+    end)
+
     it("returns the rendered JPEG base64-encoded with its mime type", function()
         local meta = { id = "1", path = "/a.nef" }
         local photo = previewPhoto(meta, function(_, _, _, cb) cb("JPEGDATA") end)
@@ -223,5 +251,74 @@ describe("HandlerPreview.getPhotoPreview", function()
 
         assert.are.equal(0, catalog.getQueryCount())
         assert.is_nil(meta.__requested)
+    end)
+end)
+
+
+describe("HandlerPreview batch preview", function()
+    it("renders in order and isolates missing photos", function()
+        local one = previewPhoto({ id = "1" }, function(_, _, _, cb) cb(fakeJpeg()) end)
+        local three = previewPhoto({ id = "3" }, function(_, _, _, cb) cb(fakeJpeg(400, 300)) end)
+        local _, Handler = setup({ one, three })
+        local result = Handler.getPhotoPreviews({ photo_ids = { "1", "2", "3" } })
+        assert.is_true(result.complete)
+        assert.are.equal(3, #result.previews)
+        assert.are.equal("1", result.previews[1].requested_id)
+        assert.matches("Photo not found", result.previews[2].error)
+        assert.are.equal("3", result.previews[3].requested_id)
+        assert.are.equal(256, result.previews[1].requested_size)
+    end)
+
+    it("batch preview timeout returns rendered photos and the in-flight tail", function()
+        local one = previewPhoto({ id = "1" }, function(_, _, _, cb) cb(fakeJpeg()) end)
+        local two = previewPhoto({ id = "2" }, function() end)
+        local _, Handler = setup({ one, two })
+        local result = Handler.getPhotoPreviews({ photo_ids = { "1", "2", "3" } })
+        assert.is_false(result.complete)
+        assert.are.equal(1, #result.previews)
+        assert.are.same({ "2", "3" }, result.remaining_ids)
+    end)
+
+    it("batch preview limit refuses oversized images even at minimum size", function()
+        local photo = previewPhoto({ id = "1" }, function(_, _, _, cb) cb(fakeJpeg(2001, 100)) end)
+        local _, Handler = setup({ photo })
+        local result = Handler.getPhotoPreviews({ photo_ids = { "1" } })
+        assert.is_true(result.complete)
+        assert.is_nil(result.previews[1].image)
+        assert.matches("2000", result.previews[1].error)
+    end)
+
+    it("batch preview limit rejects 21 ids", function()
+        local _, Handler = setup()
+        local ids = {}
+        for i = 1, 21 do ids[i] = tostring(i) end
+        assert.has_error(function() Handler.getPhotoPreviews({ photo_ids = ids }) end,
+            "photo_ids must contain between 1 and 20 photo IDs")
+    end)
+
+    it("batch preview limit preserves the 3.5 MiB per-image cap", function()
+        local photo = previewPhoto({ id = "1" }, function(_, edge, _, cb)
+            cb(fakeJpeg() .. string.rep("x", edge > 64 and 4 * 1024 * 1024 or 100))
+        end)
+        local _, Handler = setup({ photo })
+        local result = Handler.getPhotoPreviews({ photo_ids = { "1" } })
+        assert.is_true(result.complete)
+        assert.is_nil(result.previews[1].error)
+        assert.is_true(result.previews[1].bytes <= 3.5 * 1024 * 1024)
+        assert.are.equal(#fakeJpeg() + 100, result.previews[1].bytes)
+    end)
+
+    it("keeps the combined JPEG bytes within 8 MiB", function()
+        local photos = {}
+        for i = 1, 4 do
+            photos[i] = previewPhoto({ id = tostring(i) }, function(_, edge, _, cb)
+                cb(fakeJpeg() .. string.rep("x", edge > 64 and 3 * 1024 * 1024 or 100))
+            end)
+        end
+        local _, Handler = setup(photos)
+        local result = Handler.getPhotoPreviews({ photo_ids = { "1", "2", "3", "4" } })
+        assert.is_true(result.complete)
+        assert.are.equal(4, #result.previews)
+        assert.is_true(result.bytes <= 8 * 1024 * 1024)
     end)
 end)

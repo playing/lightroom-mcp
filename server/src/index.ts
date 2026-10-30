@@ -2,13 +2,15 @@
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { PluginSocket } from "./plugin-socket.js";
 import { Dispatcher } from "./dispatcher.js";
 import { readToken, tokenFilePath } from "./token.js";
 import { requestPort, responsePort } from "./ports.js";
+import { parseToolsets, type Toolset } from "./toolsets.js";
+import { parseReadOnly } from "./read-only.js";
 import { createMcpServer } from "./create-server.js";
-import { createCallToolHandler, NOT_CONNECTED_MESSAGE } from "./tool-handler.js";
+import { createCallToolHandler, NOT_CONNECTED_DETAILS, NOT_CONNECTED_MESSAGE } from "./tool-handler.js";
 import { Bridge, type Leader } from "./bridge.js";
 import { brokerPath } from "./broker.js";
 import { parseCli, helpText } from "./cli.js";
@@ -47,10 +49,15 @@ const PROBE_RECOVERY_INTERVAL_MS = 5_000;
 const STARTUP_GRACE_MS = 3_000;
 const CONNECT_POLL_MS = 50;
 const ACTION_TIMEOUTS_MS: Record<string, number> = {
+  get_photo_previews: 30_000,
   export_photos: LONG_RUNNING_TIMEOUT_MS,
   export_photo_metadata: LONG_RUNNING_TIMEOUT_MS,
   import_photos: LONG_RUNNING_TIMEOUT_MS,
+  set_process_version: LONG_RUNNING_TIMEOUT_MS,
+  set_lens_blur: LONG_RUNNING_TIMEOUT_MS,
   apply_denoise: LONG_RUNNING_TIMEOUT_MS,
+  reset_develop_adjustments: LONG_RUNNING_TIMEOUT_MS,
+  create_virtual_copies: LONG_RUNNING_TIMEOUT_MS,
   apply_auto_adjustments: LONG_RUNNING_TIMEOUT_MS,
   create_mask: LONG_RUNNING_TIMEOUT_MS,
   create_mask_batch: LONG_RUNNING_TIMEOUT_MS,
@@ -84,9 +91,13 @@ async function main() {
     return;
   }
 
+  let toolsets: readonly Toolset[];
+  let readOnly: boolean;
   let REQUEST_PORT: number;
   let RESPONSE_PORT: number;
   try {
+    toolsets = parseToolsets(process.env.LIGHTROOM_MCP_TOOLSETS);
+    readOnly = parseReadOnly(process.env.LIGHTROOM_MCP_READ_ONLY);
     REQUEST_PORT = requestPort();
     RESPONSE_PORT = responsePort();
   } catch (err) {
@@ -105,7 +116,7 @@ async function main() {
     lockHolder: () => lockHolder(REQUEST_PORT, RESPONSE_PORT),
   });
 
-  const server = createMcpServer({ callTool: (name, args, options) => bridge.callTool(name, args, options) });
+  const server = createMcpServer({ callTool: (name, args, options) => bridge.callTool(name, args, options) }, { toolsets, readOnly });
   server.oninitialized = () => void bridge.start();
 
   const transport = new StdioServerTransport();
@@ -243,7 +254,11 @@ function startLeader(REQUEST_PORT: number, RESPONSE_PORT: number): Leader {
   const callTool = createCallToolHandler({
     dispatcher,
     isReady: () => socketsConnected() && liveness.isUsable(),
-    notReadyMessage: () => (socketsConnected() ? unresponsive.current() : NOT_CONNECTED_MESSAGE),
+    notReadyMessage: () => {
+      if (socketsConnected()) return unresponsive.current();
+      console.error(`[plugin] ${NOT_CONNECTED_DETAILS}`);
+      return NOT_CONNECTED_MESSAGE;
+    },
     settleReadiness: async () => {
       await waitUntil(socketsConnected, STARTUP_GRACE_MS, CONNECT_POLL_MS);
       await liveness.settled();

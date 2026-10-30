@@ -1,6 +1,7 @@
 import { describe, it, expect, jest } from '@jest/globals';
 import { validateToolArgs } from '../src/validate-args.js';
 import { createCallToolHandler } from '../src/tool-handler.js';
+import type { Dispatcher } from '../src/dispatcher.js';
 
 describe('validateToolArgs', () => {
   it('accepts explicit export location choices and rejects string booleans', () => {
@@ -13,6 +14,162 @@ describe('validateToolArgs', () => {
       expect(validateToolArgs('export_photos', { ...base, include_location_metadata: value }))
         .toContain('include_location_metadata');
     }
+  });
+
+  it('reports a single photo_id type clause', () => {
+    expect(validateToolArgs('get_photo_metadata', { photo_id: true })).toBe(
+      'Invalid arguments for get_photo_metadata: photo_id must be string or number',
+    );
+    expect(validateToolArgs('set_rating_and_flag', { photo_ids: [true], rating: 3 })).toBe(
+      'Invalid arguments for set_rating_and_flag: photo_ids.0 must be string or number',
+    );
+    expect(validateToolArgs('get_photo_metadata', { photo_id: '' })).toContain('photo_id');
+    expect(validateToolArgs('get_photo_metadata', { photo_id: 914 })).toBeNull();
+  });
+
+  describe.each([
+    ['create_gradient_mask', { photo_id: 1, shape: 'radial', center: { x: 0.5, y: 0.5 }, width: 0.4, height: 0.6 }],
+    ['create_brush_mask', { photo_id: 1, strokes: [{ points: [{ x: 0.5, y: 0.5 }] }] }],
+    ['create_range_mask', { photo_id: 1, type: 'luminance', luminance: { min: 0.3, max: 0.6 } }],
+  ])('%s creation adjustments', (name, base) => {
+    it('accepts shared unprefixed sliders and preserves calls without adjustments', () => {
+      expect(validateToolArgs(name, base)).toBeNull();
+      expect(validateToolArgs(name, { ...base, adjustments: { exposure: 1, noise: -20, contrast: 0 } })).toBeNull();
+      expect(validateToolArgs(name, { ...base, mask_id: 'existing' })).toBeNull();
+    });
+
+    it.each([{}, { exposure: 5 }, { contrast: -101 }, { exposure: '1' }, { local_Exposure: 1 }, { unknown: 1 }])(
+      'rejects invalid adjustments before dispatch: %p', async (adjustments) => {
+        const dispatch = jest.fn<Dispatcher['call']>();
+        const result = await createCallToolHandler({ dispatcher: { call: dispatch }, isReady: () => true })(
+          name, { ...base, adjustments },
+        );
+        expect(result.isError).toBe(true);
+        expect(dispatch).not.toHaveBeenCalled();
+      },
+    );
+
+    it('rejects adjustments on an existing mask before dispatch', async () => {
+      const dispatch = jest.fn<Dispatcher['call']>();
+      const result = await createCallToolHandler({ dispatcher: { call: dispatch }, isReady: () => true })(
+        name, { ...base, mask_id: 'existing', adjustments: { exposure: 1 } },
+      );
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result.content)).toContain('adjustments');
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+  });
+  describe('get_photo_metadata batches', () => {
+    it('accepts mixed selectors, repeats and the cap with shared sections', () => {
+      for (const photo_ids of [[914, '/a.jpg', 914], Array.from({ length: 100 }, (_, i) => i + 1)]) {
+        expect(validateToolArgs('get_photo_metadata', { photo_ids })).toBeNull();
+        expect(validateToolArgs('get_photo_metadata', { photo_ids, sections: ['developSettings'] })).toBeNull();
+      }
+    });
+
+    it.each([
+      {}, { photo_id: 1, photo_ids: [1] }, { photo_ids: [] },
+      { photo_ids: Array.from({ length: 101 }, () => 1) },
+      { photo_ids: [null] }, { photo_ids: [''] }, { photo_ids: [true] },
+      { photo_ids: [1], sections: ['unknown'] }, { photo_ids: [1], extra: true },
+    ])('rejects invalid selectors before dispatch: %p', async (args) => {
+      const call = jest.fn((_action: string, _params: unknown) => Promise.resolve({ id: 'test', result: {} }));
+      const handler = createCallToolHandler({ dispatcher: { call }, isReady: () => true });
+      const result = await handler('get_photo_metadata', args);
+      expect(result.isError).toBe(true);
+      expect(call).not.toHaveBeenCalled();
+      expect(result.content[0]).toMatchObject({ type: 'text', text: expect.stringContaining('Invalid arguments for get_photo_metadata') });
+    });
+  });
+
+  it.each(['cull', 'detail', 64, 512.5, 1024, 2048])('get_photo_preview accepts size %s', size => {
+    expect(validateToolArgs('get_photo_preview', { photo_id: 914, size })).toBeNull();
+  });
+
+  it.each(['huge', 5000])('get_photo_preview explains accepted sizes for %s', size => {
+    expect(validateToolArgs('get_photo_preview', { photo_id: 914, size })).toMatch(/cull.*detail.*64.*2048/);
+  });
+
+  it.each([{}, { limit: 0 }, { limit: 10.5, offset: 2.5, query: 'vi', folder: 'User Presets' }])(
+    'list_develop_presets accepts paging and filters %p', (args) => {
+      expect(validateToolArgs('list_develop_presets', args)).toBeNull();
+    });
+
+  it.each([{ limit: -1 }, { offset: -1 }, { query: '' }, { folder: '' }, { scope: 'plugin' }, { extra: true }])(
+    'list_develop_presets rejects invalid arguments %p', (args) => {
+      expect(validateToolArgs('list_develop_presets', args)).not.toBeNull();
+    });
+
+  it.each(['Circle', 'SoapBubble', 'Blade', 'Ring', 'Anamorphic'])('set_lens_blur accepts %s bokeh', (bokeh) => {
+    expect(validateToolArgs('set_lens_blur', { photo_id: 914, bokeh })).toBeNull();
+  });
+
+  it.each([
+    { bokeh: 'Square' }, { amount: -1 }, { amount: 101 }, { amount: '50' },
+    { cat_eye: Infinity }, { highlights_boost: NaN }, { active: 1 },
+    { focal_range: { near: 0, far: 101 } }, { focal_range: { near: 0 } },
+  ])('set_lens_blur rejects invalid controls %p', (controls) => {
+    expect(validateToolArgs('set_lens_blur', { photo_id: 914, ...controls })).not.toBeNull();
+  });
+
+  it('set_lens_blur requires a change and accepts combined controls', () => {
+    expect(validateToolArgs('set_lens_blur', { photo_id: 914 })).not.toBeNull();
+    expect(validateToolArgs('set_lens_blur', { photo_id: 914, active: false, amount: 50,
+      cat_eye: 0, highlights_boost: 100, focal_range: { near: 10, far: 30 }, bokeh: 'Ring' })).toBeNull();
+    expect(validateToolArgs('get_lens_blur', { photo_id: 914 })).toBeNull();
+  });
+
+  it.each([
+    ['copy_develop_settings', { source_id: 1, target_ids: [2] }],
+    ['apply_develop_preset', { preset_name: 'Heavy', photo_ids: [2] }],
+  ])('%s accepts only boolean dry_run values', (name, args) => {
+    for (const dry_run of [undefined, false, true]) {
+      expect(validateToolArgs(name, { ...args, dry_run })).toBeNull();
+    }
+    for (const dry_run of ['true', 1, null]) {
+      expect(validateToolArgs(name, { ...args, dry_run })).toContain('dry_run');
+    }
+  });
+
+  it('remove_photos_from_catalog requires confirm true and at most 100 photo_ids', () => {
+    for (const confirm of [undefined, false, 'true', 1, null]) {
+      expect(validateToolArgs('remove_photos_from_catalog', { photo_ids: [1], confirm })).not.toBeNull();
+    }
+    expect(validateToolArgs('remove_photos_from_catalog', { photo_ids: [1], confirm: true })).toBeNull();
+    expect(validateToolArgs('remove_photos_from_catalog', { photo_ids: Array.from({ length: 100 }, (_, i) => i + 1), confirm: true })).toBeNull();
+    expect(validateToolArgs('remove_photos_from_catalog', { photo_ids: Array.from({ length: 101 }, (_, i) => i + 1), confirm: true })).not.toBeNull();
+  });
+
+  it('set_ai_metadata bounds scores and reasons and requires a change', () => {
+    for (const score of [0, 72, 100, '']) {
+      expect(validateToolArgs('set_ai_metadata', { photo_ids: [1, 2], score })).toBeNull();
+    }
+    for (const score of [-1, 101, 1.5, '72', null, false, NaN, Infinity]) {
+      expect(validateToolArgs('set_ai_metadata', { photo_ids: [1], score })).not.toBeNull();
+    }
+    for (const reason of ['', 'eyes closed', 'é'.repeat(1024)]) {
+      expect(validateToolArgs('set_ai_metadata', { photo_ids: [1], reason })).toBeNull();
+    }
+    for (const reason of [42, null, 'a'.repeat(1025), 'é'.repeat(1025)]) {
+      expect(validateToolArgs('set_ai_metadata', { photo_ids: [1], reason })).not.toBeNull();
+    }
+    expect(validateToolArgs('set_ai_metadata', { photo_ids: [1] })).not.toBeNull();
+    expect(validateToolArgs('set_ai_metadata', { photo_ids: [] , score: 72 })).not.toBeNull();
+  });
+
+  it('get_ai_metadata accepts 200 photos and rejects malformed batches', () => {
+    expect(validateToolArgs('get_ai_metadata', { photo_ids: Array.from({ length: 200 }, (_, i) => i + 1) })).toBeNull();
+    for (const photo_ids of [[], [null], Array.from({ length: 1001 }, () => 1)]) {
+      expect(validateToolArgs('get_ai_metadata', { photo_ids })).not.toBeNull();
+    }
+  });
+
+  it('bounds virtual-copy batches and accepts an optional nonblank copy name', () => {
+    expect(validateToolArgs('create_virtual_copies', { photo_ids: [914, '/a.jpg'] })).toBeNull();
+    expect(validateToolArgs('create_virtual_copies', { photo_ids: [914], copy_name: 'Experiment' })).toBeNull();
+    expect(validateToolArgs('create_virtual_copies', { photo_ids: [] })).toContain('photo_ids');
+    expect(validateToolArgs('create_virtual_copies', { photo_ids: Array.from({ length: 26 }, () => 914) })).toContain('photo_ids');
+    expect(validateToolArgs('create_virtual_copies', { photo_ids: [914], copy_name: ' ' })).toContain('copy_name');
   });
 
   it('apply_auto_adjustments requires tone or white_balance to be true', () => {
@@ -47,10 +204,29 @@ describe('validateToolArgs', () => {
   });
 
   it('accepts arguments that satisfy the published schema', () => {
+    expect(validateToolArgs('get_photo_metadata', { photo_id: 914, sections: [] })).toBeNull();
+    expect(validateToolArgs('get_photo_metadata', {
+      photo_id: 914, sections: ['developSettings', 'developSettings'],
+    })).toBeNull();
+    const invalidSection = validateToolArgs('get_photo_metadata', { photo_id: 914, sections: ['unknown'] });
+    expect(invalidSection).toContain('Invalid arguments for get_photo_metadata');
+    expect(invalidSection).toContain('sections');
     expect(validateToolArgs('get_photo_metadata', { photo_id: 914 })).toBeNull();
     expect(validateToolArgs('get_photo_metadata', { photo_id: '/a.jpg' })).toBeNull();
-    expect(validateToolArgs('set_rating', { photo_ids: [914], rating: 3 })).toBeNull();
+    expect(validateToolArgs('set_rating_and_flag', { photo_ids: [914], rating: 3 })).toBeNull();
     expect(validateToolArgs('search_photos', {})).toBeNull();
+  });
+
+  it('set_process_version accepts only named versions and explicit confirmation', () => {
+    const args = { photo_ids: [914], version: 'Version 6', confirm: true };
+    for (let version = 1; version <= 6; version++) {
+      expect(validateToolArgs('set_process_version', { ...args, version: `Version ${version}` })).toBeNull();
+    }
+    for (const version of ['Version 7', '2012']) {
+      expect(validateToolArgs('set_process_version', { ...args, version })).toContain('version');
+    }
+    expect(validateToolArgs('set_process_version', { ...args, confirm: false })).toContain('confirm');
+    expect(validateToolArgs('set_process_version', { ...args, photo_ids: Array.from({ length: 101 }, () => '1') })).toContain('photo_ids');
   });
 
   it('bounds apply_denoise amount and batch size', () => {
@@ -138,35 +314,46 @@ describe('validateToolArgs', () => {
     });
   });
 
-  describe('create_people_mask and create_landscape_mask', () => {
+  describe('create_mask people and landscape', () => {
+    it.each([
+      [{ photo_id: 1, type: 'sky', parts: ['hair'] }, 'parts'],
+      [{ photo_id: 1, type: 'subject', categories: ['sky'] }, 'categories'],
+      [{ photo_id: 1, type: 'background', parts: [] }, 'parts'],
+      [{ photo_id: 1, type: 'people', parts: ['hair'], categories: ['sky'] }, 'categories'],
+      [{ photo_id: 1, type: 'landscape', categories: ['sky'], parts: ['hair'] }, 'parts'],
+      [{ photo_id: 1, type: 'people', parts: ['hair'], adjustments: {} }, 'adjustments'],
+      [{ photo_id: 1, type: 'landscape', categories: ['sky'], adjustments: { exposure: 1 } }, 'adjustments'],
+    ])('rejects mismatched fields in %j', (args, field) => {
+      expect(validateToolArgs('create_mask', args)).toContain(field);
+    });
     it('accepts known parts for all people', () => {
-      expect(validateToolArgs('create_people_mask', { photo_id: 1, parts: ['hair', 'face_skin'] })).toBeNull();
-      expect(validateToolArgs('create_people_mask', { photo_id: 1, parts: ['entire_person'] })).toBeNull();
+      expect(validateToolArgs('create_mask', { type: 'people', photo_id: 1, parts: ['hair', 'face_skin'] })).toBeNull();
+      expect(validateToolArgs('create_mask', { type: 'people', photo_id: 1, parts: ['entire_person'] })).toBeNull();
     });
 
     it('rejects unknown, duplicate or missing people parts and a person option', () => {
-      expect(validateToolArgs('create_people_mask', { photo_id: 1, parts: ['ears'] })).toContain('parts');
-      expect(validateToolArgs('create_people_mask', { photo_id: 1, parts: ['hair', 'hair'] })).toContain('parts');
-      expect(validateToolArgs('create_people_mask', { photo_id: 1, parts: [] })).toContain('parts');
-      expect(validateToolArgs('create_people_mask', { photo_id: 1 })).toContain('parts');
-      expect(validateToolArgs('create_people_mask', { parts: ['hair'] })).toContain('photo_id');
-      expect(validateToolArgs('create_people_mask', { photo_id: 1, parts: ['hair'], person: 2 })).toContain(
+      expect(validateToolArgs('create_mask', { type: 'people', photo_id: 1, parts: ['ears'] })).toContain('parts');
+      expect(validateToolArgs('create_mask', { type: 'people', photo_id: 1, parts: ['hair', 'hair'] })).toContain('parts');
+      expect(validateToolArgs('create_mask', { type: 'people', photo_id: 1, parts: [] })).toContain('parts');
+      expect(validateToolArgs('create_mask', { type: 'people', photo_id: 1 })).toContain('parts');
+      expect(validateToolArgs('create_mask', { type: 'people', parts: ['hair'] })).toContain('photo_id');
+      expect(validateToolArgs('create_mask', { type: 'people', photo_id: 1, parts: ['hair'], person: 2 })).toContain(
         'unknown property "person"',
       );
     });
 
     it('accepts known landscape categories and rejects the rest', () => {
       expect(
-        validateToolArgs('create_landscape_mask', { photo_id: '/a.dng', categories: ['water', 'sky'] }),
+        validateToolArgs('create_mask', { type: 'landscape', photo_id: '/a.dng', categories: ['water', 'sky'] }),
       ).toBeNull();
-      expect(validateToolArgs('create_landscape_mask', { photo_id: 1, categories: ['lava'] })).toContain(
+      expect(validateToolArgs('create_mask', { type: 'landscape', photo_id: 1, categories: ['lava'] })).toContain(
         'categories',
       );
-      expect(validateToolArgs('create_landscape_mask', { photo_id: 1, categories: ['sky', 'sky'] })).toContain(
+      expect(validateToolArgs('create_mask', { type: 'landscape', photo_id: 1, categories: ['sky', 'sky'] })).toContain(
         'categories',
       );
-      expect(validateToolArgs('create_landscape_mask', { photo_id: 1 })).toContain('categories');
-      expect(validateToolArgs('create_landscape_mask', { photo_id: 1, categories: ['sky'], extra: 1 })).toContain(
+      expect(validateToolArgs('create_mask', { type: 'landscape', photo_id: 1 })).toContain('categories');
+      expect(validateToolArgs('create_mask', { type: 'landscape', photo_id: 1, categories: ['sky'], extra: 1 })).toContain(
         'unknown property "extra"',
       );
     });
@@ -351,12 +538,20 @@ describe('validateToolArgs', () => {
     expect(validateToolArgs('delete_masks', { photo_id: 914, mask_ids: tooMany })).toContain('mask_ids');
   });
 
-  it('requires a photo list for delete_empty_masks', () => {
-    expect(validateToolArgs('delete_empty_masks', { photo_ids: [914, '/a.dng'] })).toBeNull();
-    expect(validateToolArgs('delete_empty_masks', {})).toContain('photo_ids');
-    expect(validateToolArgs('delete_empty_masks', { photo_ids: [] })).toContain('photo_ids');
-    expect(validateToolArgs('delete_empty_masks', { photo_ids: 914 })).toContain('photo_ids');
-    expect(validateToolArgs('delete_empty_masks', { photo_ids: [914], extra: 1 })).toContain('unknown property "extra"');
+  it('uses only a photo list for empty-mask deletion through delete_masks', () => {
+    expect(validateToolArgs('delete_masks', { photo_ids: [914, '/a.dng'] })).toBeNull();
+    expect(validateToolArgs('delete_masks', {})).toContain('photo_ids');
+    expect(validateToolArgs('delete_masks', { photo_ids: [] })).toContain('photo_ids');
+    expect(validateToolArgs('delete_masks', { photo_ids: 914 })).toContain('photo_ids');
+    expect(validateToolArgs('delete_masks', { photo_ids: [914], extra: 1 })).toContain('unknown property "extra"');
+    expect(validateToolArgs('delete_masks', { photo_ids: [914], photo_id: 914 })).toContain('oneOf');
+    for (const target of [{ mask_ids: ['m'] }, { tool_ids: ['t'] }, { all: true }]) {
+      expect(validateToolArgs('delete_masks', { photo_ids: [914], ...target })).toContain('oneOf');
+      expect(validateToolArgs('delete_masks', { photo_id: 914, photo_ids: [914], ...target })).toContain('oneOf');
+    }
+    expect(validateToolArgs('delete_masks', { photo_ids: [914], empty: true })).toContain('unknown property "empty"');
+    expect(validateToolArgs('delete_masks', { photo_ids: [true] })).toContain('photo_ids');
+    expect(validateToolArgs('delete_masks', { photo_ids: Array(1001).fill(914) })).toContain('photo_ids');
   });
 
   it('requires photo, mask and a known numeric slider for set_mask_adjustments', () => {
@@ -377,11 +572,19 @@ describe('validateToolArgs', () => {
     expect(validateToolArgs('set_mask_adjustments', { ...ok, extra: 1 })).toContain('unknown property "extra"');
   });
 
-  it('requires photo and mask for get_mask_adjustments', () => {
-    expect(validateToolArgs('get_mask_adjustments', { photo_id: 914, mask_id: 'm-1' })).toBeNull();
-    expect(validateToolArgs('get_mask_adjustments', { photo_id: 914 })).toContain('mask_id');
-    expect(validateToolArgs('get_mask_adjustments', { mask_id: 'm-1' })).toContain('photo_id');
-    expect(validateToolArgs('get_mask_adjustments', { photo_id: 914, mask_id: 7 })).toContain('mask_id');
+  it('requires photo and mask for get_mask', () => {
+    expect(validateToolArgs('get_mask', { photo_id: 914, mask_id: 'm-1' })).toBeNull();
+    expect(validateToolArgs('get_mask', { photo_id: 914 })).toContain('mask_id');
+    expect(validateToolArgs('get_mask', { mask_id: 'm-1' })).toContain('photo_id');
+    expect(validateToolArgs('get_mask', { photo_id: 914, mask_id: 7 })).toContain('mask_id');
+    const base = { photo_id: 914, mask_id: 'm-1' };
+    expect(validateToolArgs('get_mask', { ...base, kinds: ['curves'] })).toBeNull();
+    expect(validateToolArgs('get_mask', { ...base, kinds: ['adjustments', 'point_colors'] })).toBeNull();
+    for (const kinds of [[], ['curves', 'curves'], ['unknown'], 'curves', [1]]) {
+      expect(validateToolArgs('get_mask', { ...base, kinds })).toContain('kinds');
+    }
+    expect(validateToolArgs('get_mask', { ...base, extra: 1 })).toContain('unknown property "extra"');
+
   });
 
   it('requires a photo, a mask id and a mode for invert_mask', () => {
@@ -405,7 +608,7 @@ describe('validateToolArgs', () => {
     })).toBeNull();
     expect(validateToolArgs('create_mask', { photo_id: 914 })).toContain('type');
     expect(validateToolArgs('create_mask', { type: 'sky' })).toContain('photo_id');
-    expect(validateToolArgs('create_mask', { photo_id: 914, type: 'people' })).toContain('type');
+    expect(validateToolArgs('create_mask', { photo_id: 914, type: 'people' })).toContain('parts');
     expect(validateToolArgs('create_mask', { photo_id: [914], type: 'sky' })).toContain('photo_id');
     expect(validateToolArgs('create_mask', {
       photo_id: 914,
@@ -481,8 +684,6 @@ describe('validateToolArgs', () => {
     expect(validateToolArgs('set_mask_curves', { ...base, curves: { main: [0, 0, 256, 255] } })).toContain('curves.main');
     expect(validateToolArgs('set_mask_curves', { ...base, curves: { main: [0, 0, 12.5, 255] } })).toContain('curves.main');
     expect(validateToolArgs('set_mask_curves', { photo_id: 914, curves: { main: [0, 0, 255, 255] } })).toContain('mask_id');
-    expect(validateToolArgs('get_mask_curves', base)).toBeNull();
-    expect(validateToolArgs('get_mask_curves', { photo_id: 914 })).toContain('mask_id');
   });
 
   it('validates edit_mask_point_colors actions, indexes and swatch fields', () => {
@@ -518,8 +719,6 @@ describe('validateToolArgs', () => {
       index: 1,
       swatch: { HueRange: { LowerNone: 0 } },
     })).toContain('swatch.HueRange');
-    expect(validateToolArgs('get_mask_point_colors', base)).toBeNull();
-    expect(validateToolArgs('get_mask_point_colors', { mask_id: 'm-1' })).toContain('photo_id');
   });
 
   it('validates combine_mask operation and type', () => {
@@ -550,8 +749,8 @@ describe('validateToolArgs', () => {
   });
 
   it('enforces documented ranges and types', () => {
-    expect(validateToolArgs('set_rating', { photo_ids: [914], rating: 99 })).toContain('rating');
-    expect(validateToolArgs('set_rating', { photo_ids: [914], rating: '3' })).toContain('rating');
+    expect(validateToolArgs('set_rating_and_flag', { photo_ids: [914], rating: 99 })).toContain('rating');
+    expect(validateToolArgs('set_rating_and_flag', { photo_ids: [914], rating: '3' })).toContain('rating');
     expect(validateToolArgs('search_photos', { limit: 'many' })).toContain('limit');
     expect(validateToolArgs('export_photos', {
       photo_ids: [914],
@@ -578,10 +777,10 @@ describe('validateToolArgs', () => {
   it('accepts only pick, reject or none as a flag', () => {
     const base = { photo_ids: [914] };
 
-    expect(validateToolArgs('set_flag', { ...base, flag: 'pick' })).toBeNull();
-    expect(validateToolArgs('set_flag', { ...base, flag: 'none' })).toBeNull();
-    expect(validateToolArgs('set_flag', { ...base, flag: 'rejected' })).toContain('flag');
-    expect(validateToolArgs('set_flag', { ...base, flag: -1 })).toContain('flag');
+    expect(validateToolArgs('set_rating_and_flag', { ...base, flag: 'pick' })).toBeNull();
+    expect(validateToolArgs('set_rating_and_flag', { ...base, flag: 'none' })).toBeNull();
+    expect(validateToolArgs('set_rating_and_flag', { ...base, flag: 'rejected' })).toContain('flag');
+    expect(validateToolArgs('set_rating_and_flag', { ...base, flag: -1 })).toContain('flag');
   });
 
   it('accepts IPTC location strings and rejects other types or unknown fields', () => {
@@ -600,13 +799,16 @@ describe('validateToolArgs', () => {
     expect(validateToolArgs('get_photo_preview', { photo_id: 914, size: '1024' })).toContain('size');
   });
 
-  it('accepts metadata strings and rejects other types or unknown fields', () => {
+  it('set_metadata accepts text and rejects other types or unknown fields', () => {
     const base = { photo_ids: [914] };
 
     expect(validateToolArgs('set_metadata', { ...base, title: 'Dunluce Castle', caption: '' })).toBeNull();
     expect(validateToolArgs('set_metadata', { ...base, copyright_info_url: 'https://example.com', creator_url: '' })).toBeNull();
     expect(validateToolArgs('set_metadata', { ...base, copyright_status: 'copyrighted' })).toContain('copyright_status');
     expect(validateToolArgs('set_metadata', { ...base, title: 7 })).toContain('title');
+    expect(validateToolArgs('set_metadata', { ...base, alt_text: 'A red barn', extended_description: '' })).toBeNull();
+    expect(validateToolArgs('set_metadata', { ...base, alt_text: 5 })).toContain('alt_text');
+    expect(validateToolArgs('set_metadata', { ...base, extended_description: false })).toContain('extended_description');
     expect(validateToolArgs('set_metadata', { ...base, artist: 'Jane' })).toContain('artist');
   });
 
@@ -629,14 +831,15 @@ describe('validateToolArgs', () => {
   });
 
   it('reports a missing required field', () => {
-    const msg = validateToolArgs('set_rating', { photo_ids: [914] });
+    const msg = validateToolArgs('set_rating_and_flag', { photo_ids: [914] });
 
-    expect(msg).toContain("required property 'rating'");
+    expect(msg).toContain("rating");
+    expect(msg).toContain("flag");
   });
 
   it('treats missing arguments as an empty object', () => {
     expect(validateToolArgs('search_photos', undefined)).toBeNull();
-    expect(validateToolArgs('set_rating', undefined)).toContain('required property');
+    expect(validateToolArgs('set_rating_and_flag', undefined)).toContain('required property');
   });
 
   it('reports a violation that has no field path', () => {
@@ -652,16 +855,50 @@ describe('validateToolArgs', () => {
 });
 
 describe('tool handler argument validation', () => {
-  it('forwards an explicit export location choice unchanged', async () => {
-    const call = jest.fn((_action: string, _params: unknown) =>
-      Promise.resolve({ id: 'req_1', result: { success: true } }));
-    const handler = createCallToolHandler({ dispatcher: { call }, isReady: () => true });
+  const selectorCases: { name: string; valid: Record<string, unknown>[]; invalid: Record<string, unknown>[] }[] = [
+    { name: 'set_ai_metadata',
+      valid: [{ photo_ids: [914], score: 42 }, { photo_ids: [914], reason: '' },
+        { photo_ids: [914], score: '', reason: 'clear score' }],
+      invalid: [{ photo_ids: [914] }, { photo_ids: [914], score: 101 }, { photo_ids: [914], reason: false }] },
+    { name: 'create_smart_collection',
+      valid: [{ name: 'Rated', rating: 3 }, { name: 'Camera', camera: 'Camera', edited: false }],
+      invalid: [{ name: 'Empty' }, { name: 'Bad', rating: 6 }, { name: 'Bad', edited: 'true' }] },
+    ...['get_develop_preset', 'export_develop_preset', 'apply_develop_preset'].map(name => {
+      const common = name === 'apply_develop_preset' ? { photo_ids: [914] }
+        : name === 'export_develop_preset' ? { destination_dir: '/tmp/presets' } : {};
+      return { name,
+        valid: [{ ...common, preset_uuid: 'uuid' }, { ...common, preset_name: 'name' },
+          { ...common, preset_uuid: 'uuid', preset_name: 'name', preset_scope: 'plugin' }],
+        invalid: [common, { ...common, preset_uuid: 123 }, { ...common, preset_name: 'name', preset_scope: 'unknown' }] };
+    }),
+    { name: 'apply_auto_adjustments',
+      valid: [{ photo_ids: [914], tone: true }, { photo_ids: [914], white_balance: true },
+        { photo_ids: [914], tone: true, white_balance: true }],
+      invalid: [{ photo_ids: [914] }, { photo_ids: [914], tone: false, white_balance: false },
+        { photo_ids: [914], tone: 'true' }] },
+    { name: 'delete_masks',
+      valid: [{ photo_id: 914, mask_ids: ['mask'] }, { photo_id: 914, tool_ids: ['tool'] }, { photo_id: 914, all: true }],
+      invalid: [{ photo_id: 914 }, { photo_id: 914, mask_ids: ['mask'], all: true },
+        { photo_id: 914, mask_ids: ['mask'], tool_ids: ['tool'] }, { photo_id: 914, all: false },
+        { photo_id: 914, mask_ids: [123] }] },
+  ];
 
-    for (const includeLocation of [true, false]) {
-      const args = { photo_ids: [914], destination: '/tmp', include_location_metadata: includeLocation };
-      const res = await handler('export_photos', args);
-      expect(res.isError).toBeUndefined();
-      expect(call).toHaveBeenLastCalledWith('export_photos', args);
+  it.each(selectorCases)('keeps private selector validation before dispatch for $name', async ({ name, valid, invalid }) => {
+    const call = jest.fn((_action: string, _params: unknown) => Promise.resolve({ id: 'fake', result: { ok: true } }));
+    const handler = createCallToolHandler({ dispatcher: { call }, isReady: () => true });
+    for (const args of valid) {
+      call.mockClear();
+      const result = await handler(name, args);
+      expect(result.isError).toBeUndefined();
+      expect(call).toHaveBeenCalledTimes(1);
+      expect(call).toHaveBeenCalledWith(name, args);
+    }
+    for (const args of [...invalid, ...valid.map(args => ({ ...args, unknown_field: true }))]) {
+      call.mockClear();
+      const result = await handler(name, args);
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain(`Invalid arguments for ${name}`);
+      expect(call).not.toHaveBeenCalled();
     }
   });
 
@@ -674,6 +911,19 @@ describe('tool handler argument validation', () => {
 
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain('Invalid arguments');
+    expect(call).not.toHaveBeenCalled();
+  });
+
+  it('rejects unknown metadata sections before touching Lightroom', async () => {
+    const call = jest.fn((_action: string, _params: unknown) =>
+      Promise.resolve({ id: 'req_1', result: {} }));
+    const handler = createCallToolHandler({ dispatcher: { call }, isReady: () => true });
+
+    const res = await handler('get_photo_metadata', { photo_id: 914, sections: ['unknown'] });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain('Invalid arguments for get_photo_metadata');
+    expect(res.content[0].text).toContain('sections');
     expect(call).not.toHaveBeenCalled();
   });
 

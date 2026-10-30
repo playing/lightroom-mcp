@@ -12,7 +12,7 @@ describe('create_virtual_copy contract', () => {
     const tool = TOOL_CONTRACTS.find((contract) => contract.name === 'create_virtual_copy');
 
     expect(tool).toBeDefined();
-    expect(tool?.luaHandler).toBe('HandlerVirtualCopies.createVirtualCopy');
+    expect(tool?.luaHandler).toBe('HandlerVirtualCopyGuard.createVirtualCopy');
     expect(tool?.inputSchema.additionalProperties).toBe(false);
     expect(tool?.inputSchema.required).toEqual(['photo_id']);
 
@@ -42,7 +42,7 @@ describe('create_virtual_copy contract', () => {
     );
     const source = fs.readFileSync(pluginPath, 'utf8');
 
-    expect(source).toContain("local HandlerVirtualCopies = require 'HandlerVirtualCopies'");
-    expect(source).toContain('create_virtual_copy = HandlerVirtualCopies.createVirtualCopy');
+    expect(source).toContain("local HandlerVirtualCopyGuard = require 'HandlerVirtualCopyGuard'");
+    expect(source).toContain('create_virtual_copy = HandlerVirtualCopyGuard.createVirtualCopy');
   });
 });

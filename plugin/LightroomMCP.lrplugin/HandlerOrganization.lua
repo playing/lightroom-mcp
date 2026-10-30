@@ -276,27 +276,101 @@ function OrganizationHandler.setKeywords(args)
     return {
         success = true,
         updated = updatedCount,
-        message = string.format("Updated keywords for %d photos", updatedCount)
     }
 end
 
-function OrganizationHandler.setRating(args)
+function OrganizationHandler.removeKeywordSubtree(args)
+    if type(args.parent) ~= "string" or KeywordTree.trim(args.parent) == "" then
+        error("parent is required")
+    end
+    if args.catalog_wide ~= nil and type(args.catalog_wide) ~= "boolean" then
+        error("catalog_wide must be a boolean")
+    end
+    if args.catalog_wide == true then
+        if args.photo_ids ~= nil then error("Use photo_ids or catalog_wide, not both") end
+    elseif type(args.photo_ids) ~= "table" or #args.photo_ids == 0 then
+        error("photo_ids or catalog_wide=true is required")
+    end
+
+    local catalog = LrApplication.activeCatalog()
+    local parent = KeywordTree.resolve(catalog, KeywordTree.split(args.parent))
+    if not parent then error("Keyword parent not found: " .. args.parent) end
+    local keywords = { parent }
+    local subtree = { [parent] = true }
+    KeywordTree.walk(catalog, parent, function(keyword)
+        keywords[#keywords + 1] = keyword
+        subtree[keyword] = true
+    end)
+
+    local resolved = {}
+    if args.catalog_wide == true then
+        -- Keyword photo queries can yield: collect before opening either gate.
+        local seen = {}
+        for _, keyword in ipairs(keywords) do
+            for _, photo in ipairs(keyword:getPhotos()) do
+                if not seen[photo] then
+                    seen[photo] = true
+                    resolved[#resolved + 1] = { photo = photo }
+                end
+            end
+        end
+    else
+        resolved = PhotoLookup.resolveMany(catalog, args.photo_ids)
+    end
+
+    local updated, removed = 0, 0
+    local missing, seen = {}, {}
+    catalog:withWriteAccessDo("Remove Keyword Subtree", function()
+        for _, entry in ipairs(resolved) do
+            local photo = entry.photo
+            if not photo then
+                missing[#missing + 1] = tostring(entry.id)
+            elseif not seen[photo] then
+                seen[photo] = true
+                local changed = false
+                for _, keyword in ipairs(photo:getRawMetadata('keywords') or {}) do
+                    if subtree[keyword] then
+                        photo:removeKeyword(keyword)
+                        removed = removed + 1
+                        changed = true
+                    end
+                end
+                if changed then updated = updated + 1 end
+            end
+        end
+    end)
+    return {
+        success = true,
+        updated = updated,
+        removed = removed,
+        missing = missing,
+    }
+end
+
+local PICK_STATUS = { pick = 1, none = 0, reject = -1 }
+
+function OrganizationHandler.setRatingAndFlag(args)
     if not args.photo_ids or #args.photo_ids == 0 then
         error("photo_ids is required")
     end
 
-    if not args.rating then
-        error("rating is required")
+    local hasRating = args.rating ~= nil
+    local hasFlag = args.flag ~= nil
+    if not hasRating and not hasFlag then
+        error("rating or flag is required")
     end
 
-    -- Comparing a string to a number raised a raw Lua type error that leaked
-    -- the handler's file and line to the client.
-    if type(args.rating) ~= "number" then
+    if hasRating and type(args.rating) ~= "number" then
         error("rating must be a number between 0 and 5")
     end
 
-    if args.rating < 0 or args.rating > 5 then
+    if hasRating and (args.rating < 0 or args.rating > 5 or args.rating ~= args.rating) then
         error("rating must be between 0 and 5")
+    end
+
+    local pickStatus = hasFlag and type(args.flag) == "string" and PICK_STATUS[args.flag] or nil
+    if hasFlag and pickStatus == nil then
+        error("flag must be one of: pick, reject, none")
     end
 
     local catalog = LrApplication.activeCatalog()
@@ -310,10 +384,11 @@ function OrganizationHandler.setRating(args)
 
     local resolved = PhotoLookup.resolveMany(catalog, args.photo_ids)
 
-    catalog:withWriteAccessDo("Set Rating", function()
+    catalog:withWriteAccessDo("Set Rating and Flag", function()
         for _, entry in ipairs(resolved) do
             if entry.photo then
-                entry.photo:setRawMetadata('rating', ratingValue)
+                if hasRating then entry.photo:setRawMetadata('rating', ratingValue) end
+                if hasFlag then entry.photo:setRawMetadata('pickStatus', pickStatus) end
                 updatedCount = updatedCount + 1
             else
                 missingCount = missingCount + 1
@@ -322,61 +397,12 @@ function OrganizationHandler.setRating(args)
         end
     end)
 
-    Log.info(string.format("Set rating to %d for %d photos", args.rating, updatedCount))
+    Log.info(string.format("Set rating/flag for %d photos", updatedCount))
 
     return {
         success = true,
         updated = updatedCount,
-        rating = args.rating,
         missing = missingIds,
-        message = string.format("Set rating to %d for %d photos (%d ids not found)",
-            args.rating, updatedCount, missingCount)
-    }
-end
-
--- Tool flag name -> SDK pickStatus (the value get_photo_metadata reports).
-local PICK_STATUS = { pick = 1, none = 0, reject = -1 }
-
-function OrganizationHandler.setFlag(args)
-    if not args.photo_ids or #args.photo_ids == 0 then
-        error("photo_ids is required")
-    end
-
-    -- Indexing the table with a non-string would silently miss, so name the
-    -- accepted values instead of reporting a bare "unknown flag".
-    local pickStatus = type(args.flag) == "string" and PICK_STATUS[args.flag] or nil
-    if pickStatus == nil then
-        error("flag must be one of: pick, reject, none")
-    end
-
-    local catalog = LrApplication.activeCatalog()
-    local updatedCount = 0
-    local missingIds = {}
-    local missingCount = 0
-
-    local resolved = PhotoLookup.resolveMany(catalog, args.photo_ids)
-
-    catalog:withWriteAccessDo("Set Flag", function()
-        for _, entry in ipairs(resolved) do
-            if entry.photo then
-                entry.photo:setRawMetadata('pickStatus', pickStatus)
-                updatedCount = updatedCount + 1
-            else
-                missingCount = missingCount + 1
-                missingIds[missingCount] = tostring(entry.id)
-            end
-        end
-    end)
-
-    Log.info(string.format("Set flag to %s for %d photos", args.flag, updatedCount))
-
-    return {
-        success = true,
-        updated = updatedCount,
-        flag = args.flag,
-        missing = missingIds,
-        message = string.format("Set flag to %s for %d photos (%d ids not found)",
-            args.flag, updatedCount, missingCount)
     }
 end
 
@@ -416,10 +442,7 @@ function OrganizationHandler.setColorLabel(args)
     return {
         success = true,
         updated = updatedCount,
-        label = args.label,
         missing = missingIds,
-        message = string.format("Set color label to %s for %d photos (%d ids not found)",
-            args.label, updatedCount, missingCount)
     }
 end
 

@@ -1,10 +1,17 @@
 local LrApplication = import 'LrApplication'
+local LrTasks = import 'LrTasks'
 
 local KeywordTree = require 'KeywordTree'
 local PhotoLookup = require 'PhotoLookup'
 local Log = require 'Log'
 
 local MetadataHandler = {}
+
+local function accessibilityText(photo, key)
+    local ok, value = LrTasks.pcall(function() return photo:getRawMetadata(key) end)
+    if ok and value ~= "" then return value end
+    return nil
+end
 
 -- Return the group only when it carries at least one value, so empty IPTC
 -- sections are omitted from the response (consistent with the gps group)
@@ -104,134 +111,194 @@ local function addSdkDevelopGroups(target, developSettings)
     return target
 end
 
+local function photoIds(photos)
+    if not photos or #photos == 0 then return nil end
+    local ids = {}
+    for i, photo in ipairs(photos) do
+        ids[i] = photo.localIdentifier
+    end
+    return ids
+end
+
+local function virtualCopyMetadata(photo, isVirtualCopy)
+    if isVirtualCopy then
+        local master = photo:getRawMetadata('masterPhoto')
+        return nonEmptyGroup({ masterPhotoId = master and master.localIdentifier })
+    end
+    return nonEmptyGroup({ copyIds = photoIds(photo:getRawMetadata('virtualCopies')) })
+end
+
+local function stackMetadata(photo)
+    if not photo:getRawMetadata('isInStackInFolder') then return nil end
+    local top = photo:getRawMetadata('topOfStackInFolderContainingPhoto')
+    return nonEmptyGroup({
+        position = photo:getRawMetadata('stackPositionInFolder'),
+        isCollapsed = photo:getRawMetadata('stackInFolderIsCollapsed'),
+        topPhotoId = top and top.localIdentifier,
+        memberIds = photoIds(photo:getRawMetadata('stackInFolderMembers')),
+    })
+end
+
+local function readPhotoMetadata(photo, includeDevelopSettings)
+    -- Get keywords
+    -- `keywords` stays leaf names; `keywordPaths` is the same list as
+    -- full parent-first paths, which is what tells two keywords of the
+    -- same name apart ("Orientation|portrait" vs "Type|portrait").
+    local keywords = {}
+    local keywordPaths = {}
+    local photoKeywords = photo:getRawMetadata('keywords')
+    if photoKeywords then
+        for _, kw in ipairs(photoKeywords) do
+            table.insert(keywords, kw:getName())
+            table.insert(keywordPaths, KeywordTree.pathOf(kw))
+        end
+    end
+
+    -- Get develop settings
+    local developSettings = includeDevelopSettings and photo:getDevelopSettings() or nil
+
+    -- GPS is a raw {latitude, longitude} table; omit the group when absent
+    -- or when present but carrying no coordinates.
+    local gps = photo:getRawMetadata('gps')
+    local gpsData = nil
+    if gps then
+        gpsData = nonEmptyGroup({
+            latitude = gps.latitude,
+            longitude = gps.longitude,
+            altitude = photo:getRawMetadata('gpsAltitude'),
+        })
+    end
+
+    local isVirtualCopy = photo:getRawMetadata('isVirtualCopy') == true
+    return {
+        id = photo.localIdentifier,
+        isVirtualCopy = isVirtualCopy,
+        virtualCopy = virtualCopyMetadata(photo, isVirtualCopy),
+        stack = stackMetadata(photo),
+        path = photo:getRawMetadata('path'),
+        filename = photo:getFormattedMetadata('fileName'),
+        rating = photo:getRawMetadata('rating'),
+        colorLabel = photo:getRawMetadata('colorNameForLabel'),
+        pickStatus = photo:getRawMetadata('pickStatus'),
+        keywords = keywords,
+        keywordPaths = keywordPaths,
+        -- Title / caption / headline (IPTC content description).
+        title = photo:getFormattedMetadata('title'),
+        caption = photo:getFormattedMetadata('caption'),
+        headline = photo:getFormattedMetadata('headline'),
+        accessibility = nonEmptyGroup({
+            alt_text = accessibilityText(photo, 'altTextAccessibility'),
+            extended_description = accessibilityText(photo, 'extDescrAccessibility'),
+        }),
+        -- EXIF capture data.
+        dateTimeOriginal = photo:getFormattedMetadata('dateTimeOriginal'),
+        dateTimeDigitized = photo:getFormattedMetadata('dateTimeDigitized'),
+        cameraMake = photo:getFormattedMetadata('cameraMake'),
+        cameraModel = photo:getFormattedMetadata('cameraModel'),
+        cameraSerialNumber = photo:getFormattedMetadata('cameraSerialNumber'),
+        lens = photo:getFormattedMetadata('lens'),
+        isoSpeedRating = photo:getFormattedMetadata('isoSpeedRating'),
+        focalLength = photo:getFormattedMetadata('focalLength'),
+        focalLength35mm = photo:getFormattedMetadata('focalLength35mm'),
+        aperture = photo:getFormattedMetadata('aperture'),
+        shutterSpeed = photo:getFormattedMetadata('shutterSpeed'),
+        exposureBias = photo:getFormattedMetadata('exposureBias'),
+        exposureProgram = photo:getFormattedMetadata('exposureProgram'),
+        meteringMode = photo:getFormattedMetadata('meteringMode'),
+        flash = photo:getFormattedMetadata('flash'),
+        dimensions = photo:getFormattedMetadata('dimensions'),
+        fileSize = photo:getFormattedMetadata('fileSize'),
+        fileFormat = photo:getRawMetadata('fileFormat'),
+        artist = photo:getFormattedMetadata('artist'),
+        software = photo:getFormattedMetadata('software'),
+        gps = gpsData,
+        -- IPTC location ("Sublocation" is the SDK `location` field).
+        location = nonEmptyGroup({
+            sublocation = photo:getFormattedMetadata('location'),
+            city = photo:getFormattedMetadata('city'),
+            stateProvince = photo:getFormattedMetadata('stateProvince'),
+            country = photo:getFormattedMetadata('country'),
+            isoCountryCode = photo:getFormattedMetadata('isoCountryCode'),
+        }),
+        copyright = nonEmptyGroup({
+            creator = photo:getFormattedMetadata('creator'),
+            notice = photo:getFormattedMetadata('copyright'),
+            status = photo:getFormattedMetadata('copyrightState'),
+            rightsUsageTerms = photo:getFormattedMetadata('rightsUsageTerms'),
+            infoUrl = photo:getFormattedMetadata('copyrightInfoUrl'),
+            creatorUrl = photo:getFormattedMetadata('creatorUrl'),
+        }),
+        developSettings = developSettings and addSdkDevelopGroups({
+            whiteBalance = developSettings.WhiteBalance,
+            temperature = developSettings.Temperature,
+            tint = developSettings.Tint,
+            exposure = developSettings.Exposure2012,
+            contrast = developSettings.Contrast2012,
+            highlights = developSettings.Highlights2012,
+            shadows = developSettings.Shadows2012,
+            whites = developSettings.Whites2012,
+            blacks = developSettings.Blacks2012,
+            texture = developSettings.Texture,
+            clarity = developSettings.Clarity2012,
+            dehaze = developSettings.Dehaze,
+            vibrance = developSettings.Vibrance,
+            saturation = developSettings.Saturation,
+            hsl = hslDevelopSettings(developSettings),
+            convertToGrayscale = developSettings.ConvertToGrayscale,
+            toneCurveName = developSettings.ToneCurveName2012,
+            toneCurve = developSettings.ToneCurvePV2012,
+            toneCurveRed = developSettings.ToneCurvePV2012Red,
+            toneCurveGreen = developSettings.ToneCurvePV2012Green,
+            toneCurveBlue = developSettings.ToneCurvePV2012Blue,
+            parametricShadows = developSettings.ParametricShadows,
+            parametricDarks = developSettings.ParametricDarks,
+            parametricLights = developSettings.ParametricLights,
+            parametricHighlights = developSettings.ParametricHighlights,
+        }, developSettings)
+    }
+end
+
+local MAX_METADATA_PHOTO_IDS = 100
+
 function MetadataHandler.getPhotoMetadata(args)
-    if not args.photo_id then
-        error("photo_id is required")
+    if (args.photo_id ~= nil) == (args.photo_ids ~= nil) then
+        error("Give exactly one of photo_id or photo_ids")
+    end
+    if args.photo_ids ~= nil and (type(args.photo_ids) ~= "table"
+        or #args.photo_ids == 0 or #args.photo_ids > MAX_METADATA_PHOTO_IDS) then
+        error("photo_ids must contain 1 to 100 photo IDs or file paths")
+    end
+
+    local includeDevelopSettings = false
+    for _, section in ipairs(args.sections or {}) do
+        if section ~= "developSettings" then error("Unknown sections entry: " .. tostring(section)) end
+        includeDevelopSettings = true
     end
 
     local catalog = LrApplication.activeCatalog()
-    local photoData = nil
-
-    -- Resolved OUTSIDE the read gate: the lookup runs catalog queries.
-    local photo = PhotoLookup.resolveOne(catalog, args.photo_id)
-    if not photo then
-        error("Photo not found: " .. args.photo_id)
+    -- Path resolution runs yielding catalog queries, outside the read gate.
+    local resolved = PhotoLookup.resolveMany(catalog, args.photo_ids or { args.photo_id })
+    if args.photo_id ~= nil and not resolved[1].photo then
+        error("Photo not found: " .. tostring(args.photo_id))
     end
 
+    local photos, missing = {}, {}
     catalog:withReadAccessDo(function()
-        -- Get keywords
-        -- `keywords` stays leaf names; `keywordPaths` is the same list as
-        -- full parent-first paths, which is what tells two keywords of the
-        -- same name apart ("Orientation|portrait" vs "Type|portrait").
-        local keywords = {}
-        local keywordPaths = {}
-        local photoKeywords = photo:getRawMetadata('keywords')
-        if photoKeywords then
-            for _, kw in ipairs(photoKeywords) do
-                table.insert(keywords, kw:getName())
-                table.insert(keywordPaths, KeywordTree.pathOf(kw))
+        for _, entry in ipairs(resolved) do
+            if entry.photo then
+                photos[#photos + 1] = readPhotoMetadata(entry.photo, includeDevelopSettings)
+            else
+                missing[#missing + 1] = tostring(entry.id)
             end
         end
-
-        -- Get develop settings
-        local developSettings = photo:getDevelopSettings()
-
-        -- GPS is a raw {latitude, longitude} table; omit the group when absent
-        -- or when present but carrying no coordinates.
-        local gps = photo:getRawMetadata('gps')
-        local gpsData = nil
-        if gps then
-            gpsData = nonEmptyGroup({
-                latitude = gps.latitude,
-                longitude = gps.longitude,
-                altitude = photo:getRawMetadata('gpsAltitude'),
-            })
-        end
-
-        photoData = {
-            id = photo.localIdentifier,
-            path = photo:getRawMetadata('path'),
-            filename = photo:getFormattedMetadata('fileName'),
-            rating = photo:getRawMetadata('rating'),
-            colorLabel = photo:getRawMetadata('colorNameForLabel'),
-            pickStatus = photo:getRawMetadata('pickStatus'),
-            keywords = keywords,
-            keywordPaths = keywordPaths,
-            -- Title / caption / headline (IPTC content description).
-            title = photo:getFormattedMetadata('title'),
-            caption = photo:getFormattedMetadata('caption'),
-            headline = photo:getFormattedMetadata('headline'),
-            -- EXIF capture data.
-            dateTimeOriginal = photo:getFormattedMetadata('dateTimeOriginal'),
-            dateTimeDigitized = photo:getFormattedMetadata('dateTimeDigitized'),
-            cameraMake = photo:getFormattedMetadata('cameraMake'),
-            cameraModel = photo:getFormattedMetadata('cameraModel'),
-            cameraSerialNumber = photo:getFormattedMetadata('cameraSerialNumber'),
-            lens = photo:getFormattedMetadata('lens'),
-            isoSpeedRating = photo:getFormattedMetadata('isoSpeedRating'),
-            focalLength = photo:getFormattedMetadata('focalLength'),
-            focalLength35mm = photo:getFormattedMetadata('focalLength35mm'),
-            aperture = photo:getFormattedMetadata('aperture'),
-            shutterSpeed = photo:getFormattedMetadata('shutterSpeed'),
-            exposureBias = photo:getFormattedMetadata('exposureBias'),
-            exposureProgram = photo:getFormattedMetadata('exposureProgram'),
-            meteringMode = photo:getFormattedMetadata('meteringMode'),
-            flash = photo:getFormattedMetadata('flash'),
-            dimensions = photo:getFormattedMetadata('dimensions'),
-            fileSize = photo:getFormattedMetadata('fileSize'),
-            fileFormat = photo:getRawMetadata('fileFormat'),
-            artist = photo:getFormattedMetadata('artist'),
-            software = photo:getFormattedMetadata('software'),
-            gps = gpsData,
-            -- IPTC location ("Sublocation" is the SDK `location` field).
-            location = nonEmptyGroup({
-                sublocation = photo:getFormattedMetadata('location'),
-                city = photo:getFormattedMetadata('city'),
-                stateProvince = photo:getFormattedMetadata('stateProvince'),
-                country = photo:getFormattedMetadata('country'),
-                isoCountryCode = photo:getFormattedMetadata('isoCountryCode'),
-            }),
-            copyright = nonEmptyGroup({
-                creator = photo:getFormattedMetadata('creator'),
-                notice = photo:getFormattedMetadata('copyright'),
-                status = photo:getFormattedMetadata('copyrightState'),
-                rightsUsageTerms = photo:getFormattedMetadata('rightsUsageTerms'),
-                infoUrl = photo:getFormattedMetadata('copyrightInfoUrl'),
-                creatorUrl = photo:getFormattedMetadata('creatorUrl'),
-            }),
-            developSettings = addSdkDevelopGroups({
-                whiteBalance = developSettings.WhiteBalance,
-                temperature = developSettings.Temperature,
-                tint = developSettings.Tint,
-                exposure = developSettings.Exposure2012,
-                contrast = developSettings.Contrast2012,
-                highlights = developSettings.Highlights2012,
-                shadows = developSettings.Shadows2012,
-                whites = developSettings.Whites2012,
-                blacks = developSettings.Blacks2012,
-                texture = developSettings.Texture,
-                clarity = developSettings.Clarity2012,
-                dehaze = developSettings.Dehaze,
-                vibrance = developSettings.Vibrance,
-                saturation = developSettings.Saturation,
-                hsl = hslDevelopSettings(developSettings),
-                convertToGrayscale = developSettings.ConvertToGrayscale,
-                toneCurveName = developSettings.ToneCurveName2012,
-                toneCurve = developSettings.ToneCurvePV2012,
-                toneCurveRed = developSettings.ToneCurvePV2012Red,
-                toneCurveGreen = developSettings.ToneCurvePV2012Green,
-                toneCurveBlue = developSettings.ToneCurvePV2012Blue,
-                parametricShadows = developSettings.ParametricShadows,
-                parametricDarks = developSettings.ParametricDarks,
-                parametricLights = developSettings.ParametricLights,
-                parametricHighlights = developSettings.ParametricHighlights,
-            }, developSettings)
-        }
     end)
 
-    Log.info("Retrieved metadata for photo: " .. args.photo_id)
-
-    return photoData
+    if args.photo_id ~= nil then
+        Log.info("Retrieved metadata for photo: " .. tostring(args.photo_id))
+        return photos[1]
+    end
+    Log.info(string.format("Retrieved metadata for %d photos (%d ids not found)", #photos, #missing))
+    return { photos = photos, missing = missing }
 end
 
 local function requireCoordinate(value, name, limit)
@@ -301,13 +368,7 @@ function MetadataHandler.setGps(args)
     return {
         success = true,
         updated = updatedCount,
-        latitude = args.latitude,
-        longitude = args.longitude,
-        altitude = args.altitude,
-        altitude_cleared = clearAltitude or nil,
         missing = missingIds,
-        message = string.format("Set GPS for %d photos (%d ids not found)",
-            updatedCount, missingCount)
     }
 end
 
@@ -375,8 +436,6 @@ function MetadataHandler.setLocation(args)
         updated = updatedCount,
         fields = fields,
         missing = missingIds,
-        message = string.format("Set location for %d photos (%d ids not found)",
-            updatedCount, missingCount)
     }
 end
 
@@ -390,6 +449,8 @@ local TEXT_FIELDS = {
     { arg = "rights_usage_terms", key = "rightsUsageTerms" },
     { arg = "copyright_info_url", key = "copyrightInfoUrl" },
     { arg = "creator_url", key = "creatorUrl" },
+    { arg = "alt_text", key = "altTextAccessibility", accessibility = true },
+    { arg = "extended_description", key = "extDescrAccessibility", accessibility = true },
 }
 
 -- Writes IPTC description and rights fields of photos. Fields left out are
@@ -411,14 +472,14 @@ function MetadataHandler.setMetadata(args)
             end
             -- An empty string is passed through: it is what clears the
             -- field. Lightroom stores nil on these fields as the text "nil".
-            changes[#changes + 1] = { key = field.key, value = value }
+            changes[#changes + 1] = { key = field.key, value = value, accessibility = field.accessibility }
             fields[#fields + 1] = field.arg
         end
     end
 
     if #changes == 0 then
         error("give at least one of title, caption, headline, creator, copyright, rights_usage_terms, "
-            .. "copyright_info_url, creator_url")
+            .. "copyright_info_url, creator_url, alt_text, extended_description")
     end
 
     local catalog = LrApplication.activeCatalog()
@@ -428,11 +489,34 @@ function MetadataHandler.setMetadata(args)
 
     local resolved = PhotoLookup.resolveMany(catalog, args.photo_ids)
 
+    for _, entry in ipairs(resolved) do
+        if entry.photo then
+            for _, change in ipairs(changes) do
+                if change.accessibility then
+                    local ok, err = LrTasks.pcall(function() return entry.photo:getRawMetadata(change.key) end)
+                    if not ok then
+                        Log.warn("Accessibility metadata preflight failed: " .. tostring(err))
+                        error("Accessibility text requires Lightroom Classic 13.2 or later")
+                    end
+                end
+            end
+        end
+    end
+
     catalog:withWriteAccessDo("Set Metadata", function()
         for _, entry in ipairs(resolved) do
             if entry.photo then
                 for _, change in ipairs(changes) do
-                    entry.photo:setRawMetadata(change.key, change.value)
+                    if change.accessibility then
+                        local ok, err = LrTasks.pcall(function()
+                            entry.photo:setRawMetadata(change.key, change.value)
+                        end)
+                        if not ok then
+                            error("Accessibility text requires Lightroom Classic 13.2 or later: " .. tostring(err))
+                        end
+                    else
+                        entry.photo:setRawMetadata(change.key, change.value)
+                    end
                 end
                 updatedCount = updatedCount + 1
             else
@@ -449,8 +533,6 @@ function MetadataHandler.setMetadata(args)
         updated = updatedCount,
         fields = fields,
         missing = missingIds,
-        message = string.format("Set metadata for %d photos (%d ids not found)",
-            updatedCount, missingCount)
     }
 end
 

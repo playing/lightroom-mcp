@@ -180,7 +180,6 @@ function ExportHandler.exportPhotos(args, context)
         complete = #remainingIds == 0,
         remaining_ids = #remainingIds > 0 and remainingIds or nil,
         destination = destination,
-        message = string.format("Exported %d photos to %s", exportedCount, destination)
     }
 end
 
@@ -382,8 +381,6 @@ function ExportHandler.exportPhotoMetadata(args)
         exported = #records,
         destination = destination,
         missing = missingIds,
-        message = string.format("Exported metadata for %d photos to %s (%d ids not found)",
-            #records, destination, #missingIds)
     }
 end
 

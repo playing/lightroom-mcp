@@ -153,7 +153,7 @@ node tests/e2e/mcp-runner.mjs write
 - `create_collection` with timestamped name
 - `list_collections` finds the new collection
 - `add_to_collection` adds first photo, asserts `added: 1`
-- `set_rating` 3 then restore to original
+- `set_rating_and_flag` 3 then restore to original
 - `get_photo_metadata` confirms rating roundtrip
 - `set_keywords` add `mcp_e2e_<ts>`, confirm via metadata, then remove, confirm gone
 
@@ -180,7 +180,7 @@ node tests/e2e/mcp-runner.mjs develop
 
 **What it covers**
 
-- `set_develop_settings` with `Exposure2012: 0.5`, then read back via `get_photo_metadata.developSettings.exposure`, expect ~0.5
+- `set_develop_settings` with `Exposure2012: 0.5`, then read back via `get_photo_metadata` with `sections: ["developSettings"]`, checking `developSettings.exposure`, expect ~0.5
 - Restore to 0
 - `apply_develop_preset` using the first preset returned by `list_develop_presets`
 
@@ -242,7 +242,7 @@ Not yet covered by the runner because it needs two distinct photo IDs.
    ```
 4. Verify on photo 1:
    ```sh
-   node tests/e2e/mcp-runner.mjs tool get_photo_metadata '{"photo_id":"<id1>"}'
+   node tests/e2e/mcp-runner.mjs tool get_photo_metadata '{"photo_id":"<id1>","sections":["developSettings"]}'
    ```
    Expect `developSettings.contrast == 40`, `developSettings.saturation == 20`.
 
@@ -314,14 +314,14 @@ node tests/e2e/mcp-runner.mjs failure
 
 - unknown tool name → `isError: true`, "Unknown action: …"
 - `get_photo_metadata` with bogus id → `isError: true`, "Photo not found"
-- `set_rating` with rating=9 → `isError: true`, validation message
+- `set_rating_and_flag` with rating=9 → `isError: true`, validation message
 - `create_collection` with no name → `isError: true`
 
 **Additional edges to probe by hand**
 
 | case | how | expected |
 | --- | --- | --- |
-| empty `photo_ids` array | `set_rating '{"photo_ids":[],"rating":3}'` | error "photo_ids is required" |
+| empty `photo_ids` array | `set_rating_and_flag '{"photo_ids":[],"rating":3}'` | error "photo_ids is required" |
 | `add_to_collection` with non-existent collection | use a junk name | error "Collection not found" |
 | `import_photos` source_path doesn't exist | `'{"source_path":"/nope"}'` | error "Source path does not exist" |
 | `export_photos` destination not writable | `'{"photo_ids":["<id>"],"destination":"/etc/lr_e2e_denied"}'` | error from LrExportSession |

@@ -1,6 +1,6 @@
 {
   "name": "@mskalski/lightroom-mcp",
-  "version": "0.25.0",
+  "version": "0.26.0",
   "description": "MCP server bridging Claude/Codex/ChatGPT to Adobe Lightroom Classic via a Lua plugin.",
   "type": "module",
   "main": "dist/index.js",
@@ -50,15 +50,17 @@
     "url": "https://github.com/Automaat/lightroom-mcp/issues"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "ajv": "^8.20.0"
+    "@modelcontextprotocol/server": "^2.4.0",
+    "ajv": "^8.20.0",
+    "jpeg-js": "0.4.4"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "^2.4.0",
     "@types/jest": "^30.0.0",
-    "@types/node": "^25.6.0",
+    "@types/node": "^26.0.0",
     "@typescript/native": "npm:typescript@^7.0.2",
     "eslint": "^10.4.0",
     "eslint-plugin-unused-imports": "^4.4.1",

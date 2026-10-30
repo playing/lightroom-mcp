@@ -3,6 +3,7 @@ local LrApplication = import 'LrApplication'
 local PhotoLookup = require 'PhotoLookup'
 local Log = require 'Log'
 local PhotoSummary = require 'PhotoSummary'
+local SearchHandler = require 'HandlerSearch'
 
 local CollectionsHandler = {}
 
@@ -22,6 +23,7 @@ function CollectionsHandler.listCollections(args)
                 collection = collection,
                 name = collection:getName(),
                 type = collection:type(),
+                isSmartCollection = collection:isSmartCollection(),
             })
         end
 
@@ -30,8 +32,8 @@ function CollectionsHandler.listCollections(args)
                 table.insert(all, {
                     collection = coll,
                     name = prefix .. coll:getName(),
-                    parent = collSet:getName(),
                     type = coll:type(),
+                    isSmartCollection = coll:isSmartCollection(),
                 })
             end
             for _, childSet in ipairs(collSet:getChildCollectionSets()) do
@@ -101,7 +103,7 @@ local function findNamed(items, name)
     return nil
 end
 
-function CollectionsHandler.createCollection(args)
+local function createCollection(args, searchDesc)
     if type(args.name) ~= "string" or args.name:match("^%s*$") then
         error("name is required")
     end
@@ -175,7 +177,13 @@ function CollectionsHandler.createCollection(args)
                 clash:getName(), parentSet and ("in " .. parentPath) or "at the top level"))
         end
 
-        if not catalog:createCollection(collectionName, parentSet, false) then
+        local created
+        if searchDesc then
+            created = catalog:createSmartCollection(collectionName, searchDesc, parentSet, false)
+        else
+            created = catalog:createCollection(collectionName, parentSet, false)
+        end
+        if not created then
             error("Lightroom did not create collection: " .. path)
         end
         Log.info("Created collection: " .. path)
@@ -184,8 +192,19 @@ function CollectionsHandler.createCollection(args)
     return {
         success = true,
         path = path,
-        message = "Collection created: " .. path
     }
+end
+
+function CollectionsHandler.createCollection(args)
+    return createCollection(args)
+end
+
+function CollectionsHandler.createSmartCollection(args)
+    local searchDesc = SearchHandler.buildSearchDesc(args)
+    if #searchDesc == 0 then
+        error("At least one search filter is required")
+    end
+    return createCollection(args, searchDesc)
 end
 
 -- Match the paths returned by listCollections, then bare names of nested
@@ -293,8 +312,6 @@ function CollectionsHandler.addToCollection(args)
         success = true,
         added = addedCount,
         missing = missingIds,
-        message = string.format("Added %d photos to collection (%d ids not found)",
-            addedCount, missingCount)
     }
 end
 
@@ -384,8 +401,6 @@ function CollectionsHandler.removeFromCollection(args)
         removed = removedCount,
         not_in_collection = notInCollection,
         missing = missingIds,
-        message = string.format("Removed %d photos from collection (%d not in it, %d ids not found)",
-            removedCount, notInCollection, missingCount)
     }
 end
 
@@ -430,7 +445,7 @@ function CollectionsHandler.getCollectionPhotos(args)
     local total = #photos
 
     local last = math.min(offset + limit, total)
-    local results = PhotoSummary.page(catalog, photos, offset + 1, last)
+    local results = PhotoSummary.page(catalog, photos, offset + 1, last, args.include_path == true)
 
     Log.info(string.format("Collection %s has %d photos, returning %d (offset=%d, limit=%d)",
         args.collection_name, total, #results, offset, limit))
@@ -471,8 +486,7 @@ function CollectionsHandler.deleteCollection(args)
     return {
         success = true,
         photo_count = photoCount,
-        message = string.format("Deleted collection '%s' (%d photos stay in the catalog)",
-            args.collection_name, photoCount)
+        message = "Photos stay in the catalog.",
     }
 end
 

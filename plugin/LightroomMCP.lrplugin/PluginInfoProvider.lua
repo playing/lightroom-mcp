@@ -12,23 +12,31 @@ local LrFileUtils = import 'LrFileUtils'
 local JSON = require 'JSON'
 local HandlerSearch = require 'HandlerSearch'
 local HandlerCollections = require 'HandlerCollections'
+local HandlerFolders = require 'HandlerFolders'
 local HandlerKeywords = require 'HandlerKeywords'
 local HandlerMetadata = require 'HandlerMetadata'
+local HandlerStyleSummary = require 'HandlerStyleSummary'
+local HandlerLensBlur = require 'HandlerLensBlur'
+local HandlerAiMetadata = require 'HandlerAiMetadata'
 local HandlerOrganization = require 'HandlerOrganization'
+local HandlerUndo = require 'HandlerUndo'
 local HandlerImport = require 'HandlerImport'
+local HandlerRemoveFromCatalog = require 'HandlerRemoveFromCatalog'
 local HandlerExport = require 'HandlerExport'
 local HandlerSelection = require 'HandlerSelection'
 local HandlerPreview = require 'HandlerPreview'
 local HandlerDevelop = require 'HandlerDevelop'
-local HandlerVirtualCopies = require 'HandlerVirtualCopies'
 local HandlerSnapshots = require 'HandlerSnapshots'
+local HandlerVirtualCopies = require 'HandlerVirtualCopies'
+local HandlerVirtualCopyGuard = require 'HandlerVirtualCopyGuard'
 local HandlerMasks = require 'HandlerMasks'
+local HandlerSpots = require 'HandlerSpots'
 local HandlerGradientMasks = require 'HandlerGradientMasks'
-local HandlerAiMasks = require 'HandlerAiMasks'
 local HandlerBrushMasks = require 'HandlerBrushMasks'
 local HandlerRangeMasks = require 'HandlerRangeMasks'
 local HandlerMaskDelete = require 'HandlerMaskDelete'
 local HandlerMaskAdjustments = require 'HandlerMaskAdjustments'
+local HandlerMaskRead = require 'HandlerMaskRead'
 local HandlerMaskInvert = require 'HandlerMaskInvert'
 local HandlerMaskCurves = require 'HandlerMaskCurves'
 local HandlerMaskPointColors = require 'HandlerMaskPointColors'
@@ -200,23 +208,36 @@ local DISPATCH = {
     -- separate heartbeat bookkeeping needed. See STALE_RECONNECT_SECONDS.
     ping = function(_params) return { pong = true } end,
     search_photos = HandlerSearch.searchPhotos,
+    list_folders = HandlerFolders.listFolders,
+    get_folder_photos = HandlerFolders.getFolderPhotos,
     list_collections = HandlerCollections.listCollections,
     create_collection = HandlerCollections.createCollection,
+    create_smart_collection = HandlerCollections.createSmartCollection,
     add_to_collection = HandlerCollections.addToCollection,
     get_collection_photos = HandlerCollections.getCollectionPhotos,
     remove_from_collection = HandlerCollections.removeFromCollection,
     delete_collection = HandlerCollections.deleteCollection,
+    get_lens_blur = HandlerLensBlur.get,
+    set_lens_blur = HandlerLensBlur.set,
     get_photo_metadata = HandlerMetadata.getPhotoMetadata,
-    create_virtual_copy = HandlerVirtualCopies.createVirtualCopy,
+    create_virtual_copy = HandlerVirtualCopyGuard.createVirtualCopy,
+    summarize_develop_settings = HandlerStyleSummary.summarize,
     get_photo_preview = HandlerPreview.getPhotoPreview,
+    get_photo_previews = HandlerPreview.getPhotoPreviews,
+    find_duplicate_groups = HandlerPreview.findDuplicateGroups,
+    get_photo_stats = HandlerPreview.getPhotoStats,
     set_gps = HandlerMetadata.setGps,
     set_location = HandlerMetadata.setLocation,
     set_metadata = HandlerMetadata.setMetadata,
+    set_ai_metadata = HandlerAiMetadata.setAiMetadata,
+    get_ai_metadata = HandlerAiMetadata.getAiMetadata,
     set_keywords = HandlerOrganization.setKeywords,
+    remove_keyword_subtree = HandlerOrganization.removeKeywordSubtree,
     list_keywords = HandlerKeywords.listKeywords,
     rename_keyword = HandlerKeywords.renameKeyword,
-    set_rating = HandlerOrganization.setRating,
-    set_flag = HandlerOrganization.setFlag,
+    set_rating_and_flag = HandlerOrganization.setRatingAndFlag,
+    undo_last_step = HandlerUndo.undoLastStep,
+    remove_photos_from_catalog = HandlerRemoveFromCatalog.removePhotos,
     set_color_label = HandlerOrganization.setColorLabel,
     import_photos = HandlerImport.importPhotos,
     export_photos = HandlerExport.exportPhotos,
@@ -232,31 +253,33 @@ local DISPATCH = {
     export_develop_preset = HandlerDevelop.exportDevelopPreset,
     apply_develop_preset = HandlerDevelop.applyDevelopPreset,
     copy_develop_settings = HandlerDevelop.copyDevelopSettings,
+    match_photo_style = HandlerDevelop.matchPhotoStyle,
     set_develop_settings = HandlerDevelop.setDevelopSettings,
     set_color_adjustments = HandlerDevelop.setColorAdjustments,
+    set_process_version = HandlerDevelop.setProcessVersion,
     list_develop_snapshots = HandlerSnapshots.list,
+    create_virtual_copies = HandlerVirtualCopies.create,
     create_develop_snapshot = HandlerSnapshots.create,
     apply_develop_snapshot = HandlerSnapshots.apply,
     delete_develop_snapshot = HandlerSnapshots.delete,
     apply_denoise = HandlerDevelop.applyDenoise,
+    reset_develop_adjustments = HandlerDevelop.resetDevelopAdjustments,
     apply_auto_adjustments = HandlerDevelop.applyAutoAdjustments,
     list_masks = HandlerMasks.listMasks,
+    list_spots = HandlerSpots.list,
+    update_spot = HandlerSpots.update,
+    delete_spot = HandlerSpots.delete,
     create_gradient_mask = HandlerGradientMasks.createGradientMask,
     update_gradient_mask = HandlerGradientMasks.updateGradientMask,
-    create_people_mask = HandlerAiMasks.createPeopleMask,
-    create_landscape_mask = HandlerAiMasks.createLandscapeMask,
     create_brush_mask = HandlerBrushMasks.createBrushMask,
     add_brush_strokes = HandlerBrushMasks.addBrushStrokes,
     create_range_mask = HandlerRangeMasks.createRangeMask,
     delete_masks = HandlerMaskDelete.deleteMasks,
-    delete_empty_masks = HandlerMaskDelete.deleteEmptyMasks,
     set_mask_adjustments = HandlerMaskAdjustments.setMaskAdjustments,
-    get_mask_adjustments = HandlerMaskAdjustments.getMaskAdjustments,
+    get_mask = HandlerMaskRead.getMask,
     invert_mask = HandlerMaskInvert.invertMask,
     set_mask_curves = HandlerMaskCurves.setMaskCurves,
-    get_mask_curves = HandlerMaskCurves.getMaskCurves,
     edit_mask_point_colors = HandlerMaskPointColors.editMaskPointColors,
-    get_mask_point_colors = HandlerMaskPointColors.getMaskPointColors,
     create_mask = HandlerMaskCreate.createMask,
     create_mask_batch = HandlerMaskBatch.createMaskBatch,
     combine_mask = HandlerMaskCombine.combineMask,
@@ -340,7 +363,11 @@ local function sendResponse(response)
 end
 
 local activeRequests = {}
-local LONG_ACTIONS = { export_photos = true, import_photos = true, apply_denoise = true, create_mask_batch = true }
+local LONG_ACTIONS = {
+    set_color_adjustments = HandlerDevelop.setColorAdjustments,
+    set_process_version = true, export_photos = true, import_photos = true, apply_denoise = true,
+    create_mask_batch = true, reset_develop_adjustments = true,
+}
 
 local function dispatchAction(request)
     if shutdownRequested() then return end
@@ -410,7 +437,13 @@ local function dispatchAction(request)
         sendResponse({ id = id, result = resultOrErr })
     else
         addLog("Handler " .. action .. " error: " .. tostring(resultOrErr))
-        sendResponse({ id = id, error = tostring(resultOrErr) })
+        local message = tostring(resultOrErr)
+        local source, detail = message:match("^([^\r\n]-%.lua):%d+: (.*)$")
+        if source and (source:match("^%S+%.lua$") or source:match("^[/\\]")
+            or source:match("^%a:[/\\]") or source:match("^%.%.%.")) then
+            message = detail
+        end
+        sendResponse({ id = id, error = message })
     end
     pluginState.inFlightRequests = math.max(0, pluginState.inFlightRequests - 1)
 end

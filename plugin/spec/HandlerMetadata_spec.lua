@@ -4,6 +4,7 @@ local function setup(photos)
     local catalog = helper.fakeCatalog({ photos = photos or {} })
     helper.installImport({
         LrApplication = { activeCatalog = function() return catalog end },
+        LrTasks = { pcall = pcall },
         LrLogger = helper.defaultLrLogger(),
     })
     package.loaded.HandlerMetadata = nil
@@ -11,6 +12,185 @@ local function setup(photos)
 end
 
 describe("HandlerMetadata.getPhotoMetadata", function()
+    it("returns ordered single-photo metadata for mixed ids and paths, including repeats", function()
+        local first = helper.fakePhoto({ id = 1, path = "/first.jpg", title = "First",
+            developSettings = { Exposure2012 = 0.5 } })
+        local second = helper.fakePhoto({ id = 2, path = "/second.jpg", rating = 4,
+            developSettings = { Contrast2012 = 25 } })
+        local catalog, Handler = setup({ first, second })
+        for _, sections in ipairs({ {}, { "developSettings" } }) do
+            local a = Handler.getPhotoMetadata({ photo_id = 1, sections = sections })
+            local b = Handler.getPhotoMetadata({ photo_id = 2, sections = sections })
+            local result = Handler.getPhotoMetadata({ photo_ids = { 2, "missing", "/first.jpg", 2, "999999999" },
+                sections = sections })
+            assert.are.same({ b, a, b }, result.photos)
+            assert.are.same({ "missing", "999999999" }, result.missing)
+        end
+        assert.is_false(catalog:getQueriedInsideReadAccess())
+    end)
+
+    it("returns empty photos for an all-missing batch and empty missing for found photos", function()
+        local _, Handler = setup({ helper.fakePhoto({ id = 1 }) })
+        assert.are.same({ photos = {}, missing = { "missing" } },
+            Handler.getPhotoMetadata({ photo_ids = { "missing" } }))
+        assert.are.same({}, Handler.getPhotoMetadata({ photo_ids = { 1 } }).missing)
+    end)
+
+    it("accepts the batch cap and never reads unrequested develop settings", function()
+        local photos, ids = {}, {}
+        for i = 1, 100 do
+            photos[i] = helper.fakePhoto({ id = i })
+            photos[i].getDevelopSettings = function() error("unrequested develop read") end
+            ids[i] = i
+        end
+        local _, Handler = setup(photos)
+        assert.are.equal(100, #Handler.getPhotoMetadata({ photo_ids = ids }).photos)
+    end)
+
+    it("rejects missing, conflicting and out-of-bounds batch selectors before catalog queries", function()
+        local catalog, Handler = setup({})
+        local tooMany = {}
+        for i = 1, 101 do tooMany[i] = i end
+        for _, args in ipairs({ {}, { photo_id = 1, photo_ids = { 1 } },
+            { photo_ids = {} }, { photo_ids = tooMany }, { photo_ids = "1" } }) do
+            assert.has_error(function() Handler.getPhotoMetadata(args) end)
+        end
+        assert.is_false(catalog:getQueriedInsideReadAccess())
+    end)
+
+    it("omits develop settings by default and with empty sections without calling the getter", function()
+        local photo = helper.fakePhoto({ id = "1", rating = 5, title = "Keep" })
+        photo.getDevelopSettings = function() error("unrequested develop read") end
+        local _, Handler = setup({ photo })
+        local default = Handler.getPhotoMetadata({ photo_id = "1" })
+        assert.is_nil(default.developSettings)
+        assert.are.equal(5, default.rating)
+        assert.are.equal("Keep", default.title)
+        assert.are.same(default, Handler.getPhotoMetadata({ photo_id = "1", sections = {} }))
+    end)
+
+    it("preserves all other fields and reads duplicate sections only once", function()
+        local photo = helper.fakePhoto({ id = "1", rating = 3,
+            developSettings = { Exposure2012 = 0.5, Contrast2012 = 42 } })
+        local reads = 0
+        local getDevelopSettings = photo.getDevelopSettings
+        photo.getDevelopSettings = function(self)
+            reads = reads + 1
+            return getDevelopSettings(self)
+        end
+        local _, Handler = setup({ photo })
+        local default = Handler.getPhotoMetadata({ photo_id = "1" })
+        local full = Handler.getPhotoMetadata({ photo_id = "1", sections = { "developSettings" } })
+        local duplicate = Handler.getPhotoMetadata({ photo_id = "1",
+            sections = { "developSettings", "developSettings" } })
+        assert.are.same(full, duplicate)
+        assert.are.same({ exposure = 0.5, contrast = 42 }, full.developSettings)
+        full.developSettings = nil
+        assert.are.same(default, full)
+        assert.are.equal(2, reads)
+    end)
+
+    it("returns nonempty accessibility text and omits empty fields", function()
+        local photo = helper.fakePhoto({ id = "1", altTextAccessibility = "A red barn", extDescrAccessibility = "" })
+        local _, Handler = setup({ photo })
+        assert.are.same({ alt_text = "A red barn" }, Handler.getPhotoMetadata({ photo_id = "1" }).accessibility)
+        photo:setRawMetadata("extDescrAccessibility", "A barn beside a field")
+        assert.are.equal("A barn beside a field",
+            Handler.getPhotoMetadata({ photo_id = "1" }).accessibility.extended_description)
+        photo:setRawMetadata("altTextAccessibility", "")
+        photo:setRawMetadata("extDescrAccessibility", "")
+        assert.is_nil(Handler.getPhotoMetadata({ photo_id = "1" }).accessibility)
+    end)
+
+    it("preserves metadata when older Lightroom rejects accessibility reads", function()
+        local photo = helper.fakePhoto({ id = "1", title = "Keep", rating = 5 })
+        local getRawMetadata = photo.getRawMetadata
+        photo.getRawMetadata = function(self, key)
+            if key == "altTextAccessibility" or key == "extDescrAccessibility" then error("unknown key") end
+            return getRawMetadata(self, key)
+        end
+        local _, Handler = setup({ photo })
+        local r = Handler.getPhotoMetadata({ photo_id = "1" })
+        assert.are.equal("Keep", r.title)
+        assert.are.equal(5, r.rating)
+        assert.is_nil(r.accessibility)
+    end)
+
+    it("identifies a virtual copy and its master's catalog id", function()
+        local master = helper.fakePhoto({ id = 7 })
+        local copy = helper.fakePhoto({ id = 8, isVirtualCopy = true, masterPhoto = master })
+        local _, Handler = setup({ master, copy })
+
+        local r = Handler.getPhotoMetadata({ photo_id = "8" })
+
+        assert.is_true(r.isVirtualCopy)
+        assert.are.same({ masterPhotoId = 7 }, r.virtualCopy)
+    end)
+
+    it("lists a master's virtual copies by catalog id", function()
+        local copies = { helper.fakePhoto({ id = 8 }), helper.fakePhoto({ id = 9 }) }
+        local master = helper.fakePhoto({ id = 7, isVirtualCopy = false, virtualCopies = copies })
+        local _, Handler = setup({ master })
+
+        local r = Handler.getPhotoMetadata({ photo_id = "7" })
+
+        assert.is_false(r.isVirtualCopy)
+        assert.are.same({ copyIds = { 8, 9 } }, r.virtualCopy)
+    end)
+
+    it("reports folder stack position, collapse state, top and ordered members", function()
+        local top = helper.fakePhoto({ id = 7 })
+        local photo = helper.fakePhoto({
+            id = 8, isInStackInFolder = true, stackPositionInFolder = 2,
+            stackInFolderIsCollapsed = false, topOfStackInFolderContainingPhoto = top,
+        })
+        photo:setRawMetadata('stackInFolderMembers', { top, photo })
+        local _, Handler = setup({ top, photo })
+
+        local r = Handler.getPhotoMetadata({ photo_id = "8" })
+
+        assert.are.same({ position = 2, isCollapsed = false, topPhotoId = 7, memberIds = { 7, 8 } }, r.stack)
+        photo:setRawMetadata('stackPositionInFolder', 1)
+        photo:setRawMetadata('stackInFolderIsCollapsed', true)
+        assert.is_true(Handler.getPhotoMetadata({ photo_id = "8" }).stack.isCollapsed)
+    end)
+
+    it("omits copy and stack groups when the photo has neither", function()
+        local photo = helper.fakePhoto({ id = 7, isVirtualCopy = false,
+            virtualCopies = {}, isInStackInFolder = false })
+        local _, Handler = setup({ photo })
+
+        local r = Handler.getPhotoMetadata({ photo_id = "7" })
+
+        assert.is_false(r.isVirtualCopy)
+        assert.is_nil(r.virtualCopy)
+        assert.is_nil(r.stack)
+    end)
+
+    it("reads member lists once without reading member metadata", function()
+        local members = {}
+        for i = 1, 1000 do
+            members[i] = { localIdentifier = i, getRawMetadata = function() error("member read") end }
+        end
+        local meta = { id = 7, virtualCopies = members, isInStackInFolder = true,
+            stackInFolderMembers = members, topOfStackInFolderContainingPhoto = members[1] }
+        local photo = helper.fakePhoto(meta)
+        local reads = {}
+        local original = photo.getRawMetadata
+        photo.getRawMetadata = function(self, key)
+            reads[key] = (reads[key] or 0) + 1
+            return original(self, key)
+        end
+        local _, Handler = setup({ photo })
+
+        local r = Handler.getPhotoMetadata({ photo_id = "7" })
+
+        assert.are.equal(1000, #r.virtualCopy.copyIds)
+        assert.are.equal(1000, #r.stack.memberIds)
+        assert.are.equal(1, reads.virtualCopies)
+        assert.are.equal(1, reads.stackInFolderMembers)
+    end)
+
     it("returns full metadata for a found photo", function()
         local photo = helper.fakePhoto({
             id = "42",
@@ -36,7 +216,7 @@ describe("HandlerMetadata.getPhotoMetadata", function()
         })
         local _, Handler = setup({ photo })
 
-        local r = Handler.getPhotoMetadata({ photo_id = "42" })
+        local r = Handler.getPhotoMetadata({ photo_id = "42", sections = { "developSettings" } })
 
         assert.are.equal("/p/sunset.jpg", r.path)
         assert.are.equal(5, r.rating)
@@ -63,7 +243,7 @@ describe("HandlerMetadata.getPhotoMetadata", function()
         })
         local _, Handler = setup({ photo })
 
-        local r = Handler.getPhotoMetadata({ photo_id = "43" })
+        local r = Handler.getPhotoMetadata({ photo_id = "43", sections = { "developSettings" } })
 
         assert.are.equal(-8, r.developSettings.hsl.HueAdjustmentRed)
         assert.are.equal(-15, r.developSettings.hsl.SaturationAdjustmentOrange)
@@ -79,7 +259,7 @@ describe("HandlerMetadata.getPhotoMetadata", function()
         })
         local _, Handler = setup({ photo })
 
-        local r = Handler.getPhotoMetadata({ photo_id = "44" })
+        local r = Handler.getPhotoMetadata({ photo_id = "44", sections = { "developSettings" } })
 
         assert.is_nil(r.developSettings.hsl)
     end)
@@ -114,7 +294,7 @@ describe("HandlerMetadata.getPhotoMetadata", function()
         })
         local _, Handler = setup({ photo })
 
-        local d = Handler.getPhotoMetadata({ photo_id = "45" }).developSettings
+        local d = Handler.getPhotoMetadata({ photo_id = "45", sections = { "developSettings" } }).developSettings
 
         assert.are.same({ LensProfileEnable = 1, LensManualDistortionAmount = 12 }, d.lens)
         assert.are.same({ PerspectiveUpright = 1, PerspectiveVertical = -5, PerspectiveAspect = 0 }, d.transform)
@@ -169,7 +349,7 @@ describe("HandlerMetadata.getPhotoMetadata", function()
             })
             local _, Handler = setup({ photo })
 
-            local d = Handler.getPhotoMetadata({ photo_id = "47" }).developSettings
+            local d = Handler.getPhotoMetadata({ photo_id = "47", sections = { "developSettings" } }).developSettings
 
             assert.are.same(expected, d[field])
             for otherField in pairs(EXPECTED_SDK_GROUPS) do
@@ -189,7 +369,7 @@ describe("HandlerMetadata.getPhotoMetadata", function()
         })
         local _, Handler = setup({ photo })
 
-        local d = Handler.getPhotoMetadata({ photo_id = "46" }).developSettings
+        local d = Handler.getPhotoMetadata({ photo_id = "46", sections = { "developSettings" } }).developSettings
 
         assert.is_nil(d.lens)
         assert.is_nil(d.transform)
@@ -221,7 +401,7 @@ describe("HandlerMetadata.getPhotoMetadata", function()
         })
         local _, Handler = setup({ photo })
 
-        local r = Handler.getPhotoMetadata({ photo_id = "7" })
+        local r = Handler.getPhotoMetadata({ photo_id = "7", sections = { "developSettings" } })
 
         assert.are.equal("Main Street", r.title)
         assert.are.equal("Downtown at dusk", r.caption)
@@ -239,7 +419,7 @@ describe("HandlerMetadata.getPhotoMetadata", function()
         local photo = helper.fakePhoto({ id = "8", path = "/p/no-gps.jpg", fileName = "no-gps.jpg" })
         local _, Handler = setup({ photo })
 
-        local r = Handler.getPhotoMetadata({ photo_id = "8" })
+        local r = Handler.getPhotoMetadata({ photo_id = "8", sections = { "developSettings" } })
         assert.is_nil(r.gps)
         assert.is_nil(r.location)
         assert.is_nil(r.copyright)
@@ -249,7 +429,7 @@ describe("HandlerMetadata.getPhotoMetadata", function()
         local photo = helper.fakePhoto({ id = "10", fileName = "empty-gps.jpg", gps = {} })
         local _, Handler = setup({ photo })
 
-        local r = Handler.getPhotoMetadata({ photo_id = "10" })
+        local r = Handler.getPhotoMetadata({ photo_id = "10", sections = { "developSettings" } })
         assert.is_nil(r.gps)
     end)
 
@@ -312,6 +492,7 @@ describe("HandlerMetadata.setGps", function()
 
         assert.is_true(r.success)
         assert.are.equal(2, r.updated)
+        assert.is_nil(r.message)
         assert.are.same({ latitude = 48.5818, longitude = 7.7509 }, p1:getRawMetadata("gps"))
         assert.are.same({ latitude = 48.5818, longitude = 7.7509 }, p2:getRawMetadata("gps"))
     end)
@@ -325,7 +506,10 @@ describe("HandlerMetadata.setGps", function()
 
         local r = Handler.setGps({ photo_ids = { "1" }, latitude = 0, longitude = 0, altitude = 140.5 })
         assert.are.equal(140.5, p1:getRawMetadata("gpsAltitude"))
-        assert.are.equal(140.5, r.altitude)
+        assert.is_nil(r.altitude)
+        assert.is_nil(r.latitude)
+        assert.is_nil(r.longitude)
+        assert.is_nil(r.message)
     end)
 
     it("clears altitude with clear_altitude", function()
@@ -335,7 +519,7 @@ describe("HandlerMetadata.setGps", function()
         local r = Handler.setGps({ photo_ids = { "1" }, latitude = 54.4, longitude = 18.6, clear_altitude = true })
 
         assert.is_nil(p1:getRawMetadata("gpsAltitude"))
-        assert.is_true(r.altitude_cleared)
+        assert.is_nil(r.altitude_cleared)
         assert.is_nil(r.altitude)
     end)
 
@@ -422,6 +606,7 @@ describe("HandlerMetadata.setLocation", function()
         assert.is_true(r.success)
         assert.are.equal(2, r.updated)
         assert.are.same({ "sublocation", "city", "state_province", "country", "iso_country_code" }, r.fields)
+        assert.is_nil(r.message)
         for _, p in ipairs({ p1, p2 }) do
             assert.are.equal("Nelson-Atkins Museum of Art", p:getRawMetadata("location"))
             assert.are.equal("Kansas City", p:getRawMetadata("city"))
@@ -500,6 +685,52 @@ describe("HandlerMetadata.setLocation", function()
 end)
 
 describe("HandlerMetadata.setMetadata", function()
+    it("writes and clears accessibility text on multiple photos", function()
+        local photos = { helper.fakePhoto({ id = "1" }), helper.fakePhoto({ id = "2" }) }
+        local _, Handler = setup(photos)
+        local r = Handler.setMetadata({ photo_ids = { "1", "2" }, alt_text = "A red barn",
+            extended_description = "A barn beside a field" })
+        assert.are.equal(2, r.updated)
+        assert.are.same({ "alt_text", "extended_description" }, r.fields)
+        for _, photo in ipairs(photos) do
+            assert.are.equal("A red barn", photo:getRawMetadata("altTextAccessibility"))
+            assert.are.equal("A barn beside a field", photo:getRawMetadata("extDescrAccessibility"))
+        end
+        Handler.setMetadata({ photo_ids = { "1", "2" }, title = "New" })
+        for _, photo in ipairs(photos) do
+            assert.are.equal("A red barn", photo:getRawMetadata("altTextAccessibility"))
+        end
+        Handler.setMetadata({ photo_ids = { "1", "2" }, alt_text = "", extended_description = "" })
+        for _, photo in ipairs(photos) do
+            assert.are.equal("", photo:getRawMetadata("altTextAccessibility"))
+            assert.are.equal("", photo:getRawMetadata("extDescrAccessibility"))
+        end
+    end)
+
+    it("rejects unsupported accessibility fields before changing ordinary fields", function()
+        local photo = helper.fakePhoto({ id = "1", title = "Keep" })
+        local getRawMetadata = photo.getRawMetadata
+        photo.getRawMetadata = function(self, key)
+            if key == "altTextAccessibility" or key == "extDescrAccessibility" then error("unknown key") end
+            return getRawMetadata(self, key)
+        end
+        photo.setRawMetadata = function() error("unexpected write") end
+        local _, Handler = setup({ photo })
+        assert.has_error(function()
+            Handler.setMetadata({ photo_ids = { "1" }, title = "New", alt_text = "A red barn" })
+        end, "Accessibility text requires Lightroom Classic 13.2 or later")
+        assert.are.equal("Keep", photo:getRawMetadata("title"))
+    end)
+
+    it("explains the Lightroom requirement when an accessibility write fails", function()
+        local photo = helper.fakePhoto({ id = "1" })
+        photo.setRawMetadata = function() error("unknown key", 0) end
+        local _, Handler = setup({ photo })
+        assert.has_error(function()
+            Handler.setMetadata({ photo_ids = { "1" }, extended_description = "A barn" })
+        end, "Accessibility text requires Lightroom Classic 13.2 or later: unknown key")
+    end)
+
     it("writes every given field to found photos", function()
         local p1 = helper.fakePhoto({ id = "1", path = "/a.jpg" })
         local p2 = helper.fakePhoto({ id = "2", path = "/b.jpg", title = "Old" })
@@ -521,6 +752,7 @@ describe("HandlerMetadata.setMetadata", function()
         assert.are.equal(2, r.updated)
         assert.are.same({ "title", "caption", "headline", "creator", "copyright",
             "rights_usage_terms", "copyright_info_url", "creator_url" }, r.fields)
+        assert.is_nil(r.message)
         for _, p in ipairs({ p1, p2 }) do
             assert.are.equal("Dunluce Castle", p:getRawMetadata("title"))
             assert.are.equal("Ruins on the Causeway Coast", p:getRawMetadata("caption"))
@@ -581,7 +813,7 @@ describe("HandlerMetadata.setMetadata", function()
         assert.has_error(function() Handler.setMetadata({ title = "T" }) end, "photo_ids is required")
         assert.has_error(function() Handler.setMetadata({ photo_ids = { "1" } }) end,
             "give at least one of title, caption, headline, creator, copyright, rights_usage_terms, "
-            .. "copyright_info_url, creator_url")
+            .. "copyright_info_url, creator_url, alt_text, extended_description")
         assert.has_error(function() Handler.setMetadata({ photo_ids = { "1" }, title = 7 }) end,
             "title must be a string")
 

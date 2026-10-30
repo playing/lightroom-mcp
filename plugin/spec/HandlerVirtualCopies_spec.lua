@@ -1,334 +1,169 @@
 local helper = require 'spec_helper'
 
-local function assertErrorContains(fn, expected)
-    local ok, err = pcall(fn)
-    assert.is_false(ok)
-    assert.is_truthy(string.find(tostring(err), expected, 1, true))
-end
+describe('HandlerVirtualCopies', function()
+    local Handler, catalog, photos, calls, state
 
-local function setup(opts)
-    opts = opts or {}
-    local catalog = helper.fakeCatalog(opts)
-    helper.installImport({
-        LrApplication = { activeCatalog = function() return catalog end },
-        LrTasks = { pcall = pcall },
-        LrLogger = helper.defaultLrLogger(),
-    })
-    package.loaded.HandlerVirtualCopies = nil
-    return catalog, require 'HandlerVirtualCopies'
-end
-
-describe("HandlerVirtualCopies.createVirtualCopy", function()
-    it("errors without photo_id", function()
-        local _, Handler = setup({})
-
-        assert.has_error(function()
-            Handler.createVirtualCopy({})
-        end, "photo_id is required")
-    end)
-
-    it("creates a virtual copy through the explicit catalog source API", function()
-        local source = helper.fakePhoto({
-            id = "100",
-            fileName = "DSC0001.ARW",
-            path = "C:/photos/DSC0001.ARW",
-        })
-        local copy = helper.fakePhoto({
-            id = "101",
-            fileName = "DSC0001.ARW",
-            path = "C:/photos/DSC0001.ARW",
-            copyName = "AI_MCP_VALIDATION_100",
-        })
-        local catalog, Handler = setup({ photos = { source } })
-        catalog.createVirtualCopy = function(_, photo)
-            assert.are.equal(0, catalog.getWriteAccessCount())
-            assert.are.same(source, photo)
-            return copy
+    local function setup(opts)
+        opts = opts or {}
+        photos = {}
+        for i = 1, 3 do
+            photos[i] = helper.fakePhoto({ id = tostring(i), path = '/' .. i .. '.jpg' })
         end
-
-        local r = Handler.createVirtualCopy({
-            photo_id = "100",
-            copy_name = "AI_MCP_VALIDATION_100",
+        if opts.virtualInput then
+            photos[3] = helper.fakePhoto({ id = '3', path = '/1.jpg',
+                isVirtualCopy = true, masterPhoto = photos[1] })
+        end
+        local source = {}
+        state = { active = photos[1], selected = { photos[1], photos[2] }, sources = { source } }
+        if opts.empty then state.active, state.selected = nil, {} end
+        calls = { create = {}, selection = {}, sources = {} }
+        catalog = helper.fakeCatalog({ photos = photos })
+        catalog.kAllPhotos = 'all'
+        local getTargets = catalog.getTargetPhotos
+        local setSelected = catalog.setSelectedPhotos
+        catalog.getTargetPhoto = function() return state.active end
+        catalog.getTargetPhotos = function(self)
+            getTargets(self)
+            return state.selected
+        end
+        catalog.getActiveSources = function() return state.sources end
+        catalog.setActiveSources = function(_, sources)
+            calls.sources[#calls.sources + 1] = sources
+            state.sources = sources
+        end
+        catalog.setSelectedPhotos = function(self, active, selected)
+            setSelected(self, active, selected)
+            calls.selection[#calls.selection + 1] = { active = active, photos = selected }
+            if opts.failRestore and #calls.create > 0 and active == photos[1] then return end
+            if opts.restricted and active == photos[3] and state.sources[1] ~= 'all' then return end
+            state.active, state.selected = active, selected
+        end
+        catalog.createVirtualCopies = function(_, name)
+            assert.is_false(catalog.isInsideReadAccess())
+            assert.are.equal(1, #state.selected)
+            calls.create[#calls.create + 1] = { photo = state.active, name = name }
+            if opts.failCreate then error('SDK failure') end
+            local master = state.active:getRawMetadata('masterPhoto') or state.active
+            local copy = helper.fakePhoto({ id = tostring(100 + #calls.create),
+                isVirtualCopy = true, masterPhoto = master })
+            state.active, state.selected = copy, { copy }
+            return { copy }
+        end
+        helper.installImport({
+            LrApplication = { activeCatalog = function() return catalog end },
+            LrApplicationView = {},
+            LrDevelopController = {},
+            LrLogger = helper.defaultLrLogger(),
+            LrSelection = { selectNone = function() state.active, state.selected = nil, {} end },
+            LrTasks = { pcall = pcall, sleep = function() end },
         })
+        package.loaded.DevelopSession = nil
+        package.loaded.HandlerVirtualCopies = nil
+        Handler = require 'HandlerVirtualCopies'
+    end
 
-        assert.is_true(r.success)
-        assert.are.equal("100", r.source.id)
-        assert.are.equal("101", r.virtual_copy.id)
+    local function assertRestored()
+        assert.are.equal(photos[1], state.active)
+        assert.are.same({ photos[1], photos[2] }, state.selected)
+        local last = calls.selection[#calls.selection]
+        assert.are.equal(photos[1], last.active)
+        assert.are.same({ photos[1], photos[2] }, last.photos)
+    end
+
+    it('creates named copies and returns stable photo, master and copy ids', function()
+        setup()
+        local result = Handler.create({ photo_ids = { '3', '2' }, copy_name = 'Experiment' })
+        assert.are.equal(2, result.created)
+        assert.are.same({
+            { photo_id = '3', master_id = '3', copy_id = '101' },
+            { photo_id = '2', master_id = '2', copy_id = '102' },
+        }, result.copies)
+        assert.are.equal('Experiment', calls.create[1].name)
+        assert.are.equal('Experiment', calls.create[2].name)
+        assertRestored()
+        assert.is_false(catalog.getQueriedInsideReadAccess())
+        assert.is_false(catalog.getQueriedInsideWriteAccess())
+        assert.are.equal(0, catalog.getReadAccessCount())
         assert.are.equal(0, catalog.getWriteAccessCount())
     end)
 
-    it("falls back to a photo-level virtual copy API", function()
-        local copy = helper.fakePhoto({
-            id = "102",
-            fileName = "DSC0002.ARW",
-            path = "C:/photos/DSC0002.ARW",
-        })
-        local source = helper.fakePhoto({
-            id = "100",
-            fileName = "DSC0002.ARW",
-            path = "C:/photos/DSC0002.ARW",
-        })
-        source.createVirtualCopy = function()
-            return copy
-        end
-        local _, Handler = setup({ photos = { source } })
-
-        local r = Handler.createVirtualCopy({ photo_id = "100" })
-
-        assert.is_true(r.success)
-        assert.are.equal("102", r.virtual_copy.id)
+    it('deduplicates ids and paths to the same photo and reports missing ids', function()
+        setup()
+        local result = Handler.create({ photo_ids = { '3', '3', '/3.jpg', '999' } })
+        assert.are.equal(1, result.created)
+        assert.are.same({ '999' }, result.missing)
+        assert.is_nil(calls.create[1].name)
+        assertRestored()
     end)
 
-    it("falls back to the verified selected-photo catalog API", function()
-        local source = helper.fakePhoto({
-            id = "100",
-            fileName = "DSC0005.ARW",
-            path = "C:/photos/DSC0005.ARW",
-        })
-        local previousActive = helper.fakePhoto({
-            id = "200",
-            fileName = "previous.ARW",
-            path = "C:/photos/previous.ARW",
-        })
-        local previousOther = helper.fakePhoto({
-            id = "201",
-            fileName = "previous-other.ARW",
-            path = "C:/photos/previous-other.ARW",
-        })
-        local copy = helper.fakePhoto({
-            id = "105",
-            fileName = "DSC0005.ARW",
-            path = "C:/photos/DSC0005.ARW",
-        })
-        local currentActive = previousActive
-        local currentSelection = { previousActive, previousOther }
-        local activeSources = { "previous-source" }
-        local activeSourceCalls = {}
-        local catalog, Handler = setup({ photos = { source, previousActive, previousOther } })
-        catalog.kAllPhotos = "all-photos"
-        catalog.getActiveSources = function()
-            return activeSources
-        end
-        catalog.setActiveSources = function(_, sources)
-            table.insert(activeSourceCalls, sources)
-            activeSources = sources
-            return true
-        end
-        catalog.getTargetPhoto = function()
-            return currentActive
-        end
-        catalog.getTargetPhotos = function()
-            return currentSelection
-        end
-        catalog.setSelectedPhotos = function(_, activePhoto, otherPhotos)
-            currentActive = activePhoto
-            currentSelection = { activePhoto }
-            for _, photo in ipairs(otherPhotos) do
-                table.insert(currentSelection, photo)
-            end
-        end
-        catalog.createVirtualCopies = function(_, copyName)
-            assert.is_nil(copyName)
-            assert.are.same(source, currentActive)
-            return { copy }
-        end
-
-        local r = Handler.createVirtualCopy({ photo_id = "100" })
-
-        assert.is_true(r.success)
-        assert.are.equal("105", r.virtual_copy.id)
-        assert.are.same("all-photos", activeSourceCalls[1])
-        assert.are.same({ "previous-source" }, activeSourceCalls[2])
-        assert.are.same(previousActive, currentActive)
-        assert.are.same({ previousActive, previousOther }, currentSelection)
+    it('selects only the requested photo even when it is already active', function()
+        setup()
+        Handler.create({ photo_ids = { '1' } })
+        assert.are.equal(1, #calls.create)
+        assert.are.equal(photos[1], calls.create[1].photo)
+        assertRestored()
     end)
 
-    it("does not create when Lightroom selection did not switch to the source", function()
-        local source = helper.fakePhoto({
-            id = "100",
-            fileName = "DSC0007.ARW",
-            path = "C:/photos/DSC0007.ARW",
-        })
-        local selected = helper.fakePhoto({
-            id = "200",
-            fileName = "selected.ARW",
-            path = "C:/photos/selected.ARW",
-        })
-        local catalog, Handler = setup({ photos = { source, selected } })
-        catalog.kAllPhotos = "all-photos"
-        catalog.getActiveSources = function()
-            return { "previous-source" }
-        end
-        catalog.setActiveSources = function()
-            return true
-        end
-        catalog.getTargetPhoto = function()
-            return selected
-        end
-        catalog.getTargetPhotos = function()
-            return { selected }
-        end
-        catalog.setSelectedPhotos = function() end
-        catalog.createVirtualCopies = function()
-            error("createVirtualCopies should not be called")
-        end
-
-        assertErrorContains(function()
-            Handler.createVirtualCopy({ photo_id = "100" })
-        end, "selected_photo_not_changed")
+    it('returns the original master when the input is itself a virtual copy', function()
+        setup({ virtualInput = true })
+        local result = Handler.create({ photo_ids = { '3', '1' } })
+        assert.are.equal(2, result.created)
+        assert.are.same({ photo_id = '3', master_id = '1', copy_id = '101' }, result.copies[1])
+        assert.are.same({ photo_id = '1', master_id = '1', copy_id = '102' }, result.copies[2])
+        assertRestored()
     end)
 
-    for _, scenario in ipairs({ "multiple", "empty", "wrong", "unreadable" }) do
-        it("does not create with an unisolated selection: " .. scenario, function()
-            local source = helper.fakePhoto({ id = "100", path = "C:/photos/source.ARW" })
-            local previous = helper.fakePhoto({ id = "200", path = "C:/photos/previous.ARW" })
-            local active = previous
-            local selection = { previous }
-            local sources = { "previous-source" }
-            local catalog, Handler = setup({ photos = { source, previous } })
-            catalog.kAllPhotos = "all-photos"
-            catalog.getActiveSources = function() return sources end
-            catalog.setActiveSources = function(_, value) sources = value return true end
-            catalog.getTargetPhoto = function() return active end
-            catalog.getTargetPhotos = function()
-                if active == source and scenario == "unreadable" then error("read failed") end
-                return selection
-            end
-            catalog.setSelectedPhotos = function(_, value, others)
-                active = value
-                if value == source then
-                    if scenario == "multiple" then selection = { source, previous }
-                    elseif scenario == "wrong" then selection = { previous }
-                    else selection = {} end
-                else
-                    selection = { value }
-                    for _, photo in ipairs(others) do table.insert(selection, photo) end
-                end
-            end
-            local created = false
-            catalog.createVirtualCopies = function() created = true return {} end
-
-            assertErrorContains(function()
-                Handler.createVirtualCopy({ photo_id = "100" })
-            end, "selected_photo_set_not_isolated")
-            assert.is_false(created)
-            assert.are.equal(previous, active)
-            assert.are.same({ previous }, selection)
-            assert.are.same({ "previous-source" }, sources)
-        end)
-    end
-
-    it("rejects a created photo that does not match the source file", function()
-        local source = helper.fakePhoto({
-            id = "100",
-            fileName = "DSC0006.ARW",
-            path = "C:/photos/DSC0006.ARW",
-        })
-        local wrongCopy = helper.fakePhoto({
-            id = "106",
-            fileName = "OTHER.ARW",
-            path = "C:/photos/OTHER.ARW",
-        })
-        local catalog, Handler = setup({ photos = { source } })
-        catalog.createVirtualCopy = function()
-            return wrongCopy
-        end
-
-        assertErrorContains(function()
-            Handler.createVirtualCopy({ photo_id = "100" })
-        end, "Lightroom SDK virtual copy creation API unavailable")
+    it('restores the view source after falling back to All Photographs', function()
+        setup({ restricted = true })
+        local originalSources = state.sources
+        Handler.create({ photo_ids = { '3' } })
+        assert.are.equal('all', calls.sources[1][1])
+        assert.are.same(originalSources, state.sources)
+        assertRestored()
     end)
 
-    it("rejects a created photo that is actually the source photo", function()
-        local source = helper.fakePhoto({
-            id = "100",
-            fileName = "DSC0009.ARW",
-            path = "C:/photos/DSC0009.ARW",
-        })
-        local catalog, Handler = setup({ photos = { source } })
-        catalog.createVirtualCopy = function()
-            return source
-        end
-
-        assertErrorContains(function()
-            Handler.createVirtualCopy({ photo_id = "100" })
-        end, "Lightroom SDK virtual copy creation API unavailable")
+    it('restores an empty selection', function()
+        setup({ empty = true })
+        Handler.create({ photo_ids = { '3' } })
+        assert.is_nil(state.active)
+        assert.are.same({}, state.selected)
     end)
 
-    it("rejects a created photo when source file identity is unavailable", function()
-        local source = helper.fakePhoto({
-            id = "100",
-            fileName = "DSC0008.ARW",
-        })
-        local copy = helper.fakePhoto({
-            id = "108",
-            fileName = "DSC0008.ARW",
-        })
-        local catalog, Handler = setup({ photos = { source } })
-        catalog.createVirtualCopy = function()
-            return copy
-        end
-
-        assertErrorContains(function()
-            Handler.createVirtualCopy({ photo_id = "100" })
-        end, "Lightroom SDK virtual copy creation API unavailable")
+    it('restores selection when the SDK fails and releases the session lock', function()
+        setup({ failCreate = true })
+        local ok, failure = pcall(Handler.create, { photo_ids = { '3' } })
+        assert.is_false(ok)
+        assert.matches('SDK failure', failure, 1, true)
+        assertRestored()
+        ok, failure = pcall(Handler.create, { photo_ids = { '3' } })
+        assert.is_false(ok)
+        assert.matches('SDK failure', failure, 1, true)
     end)
 
-    it("errors clearly when Lightroom exposes no virtual copy API", function()
-        local source = helper.fakePhoto({
-            id = "100",
-            fileName = "DSC0003.ARW",
-            path = "C:/photos/DSC0003.ARW",
-        })
-        local _, Handler = setup({ photos = { source } })
-
-        assert.has_error(function()
-            Handler.createVirtualCopy({ photo_id = "100" })
-        end, "Lightroom SDK virtual copy creation API unavailable")
+    it('reports a failed selection restore', function()
+        setup({ failRestore = true })
+        local ok, failure = pcall(Handler.create, { photo_ids = { '3' } })
+        assert.is_false(ok)
+        assert.matches('Could not restore the previous photo selection', failure, 1, true)
     end)
 
-    it("attempts to set the optional copy name", function()
-        local source = helper.fakePhoto({
-            id = "100",
-            fileName = "DSC0004.ARW",
-            path = "C:/photos/DSC0004.ARW",
-        })
-        local copy = helper.fakePhoto({
-            id = "103",
-            fileName = "DSC0004.ARW",
-            path = "C:/photos/DSC0004.ARW",
-        })
-        local catalog, Handler = setup({ photos = { source } })
-        local currentActive = nil
-        catalog.kAllPhotos = "all-photos"
-        catalog.getActiveSources = function()
-            return {}
-        end
-        catalog.setActiveSources = function()
-            return true
-        end
-        catalog.getTargetPhoto = function()
-            return currentActive
-        end
-        catalog.getTargetPhotos = function()
-            if currentActive then return { currentActive } end
-            return {}
-        end
-        catalog.setSelectedPhotos = function(_, activePhoto)
-            currentActive = activePhoto
-        end
-        catalog.createVirtualCopies = function(_, copyName)
-            assert.are.equal("AI_MCP_VALIDATION_100", copyName)
-            return { copy }
-        end
+    it('leaves selection untouched when no photo resolves', function()
+        setup()
+        assert.has_error(function() Handler.create({ photo_ids = { '999' } }) end,
+            'No photos matched photo_ids')
+        assert.are.same({}, calls.selection)
+        assert.are.same({}, calls.create)
+    end)
 
-        local r = Handler.createVirtualCopy({
-            photo_id = "100",
-            copy_name = "AI_MCP_VALIDATION_100",
-        })
-
-        assert.is_true(r.copy_name_set)
-        assert.are.equal("AI_MCP_VALIDATION_100", r.virtual_copy.copyName)
-        assert.are.equal("AI_MCP_VALIDATION_100", copy:getRawMetadata("copyName"))
+    it('rejects malformed inputs before changing the selection', function()
+        setup()
+        for _, args in ipairs({ {}, { photo_ids = {} }, { photo_ids = { false } },
+            { photo_ids = { '3' }, copy_name = ' ' } }) do
+            assert.has_error(function() Handler.create(args) end)
+        end
+        local ids = {}
+        for i = 1, 26 do ids[i] = '3' end
+        assert.has_error(function() Handler.create({ photo_ids = ids }) end)
+        assert.are.same({}, calls.selection)
     end)
 end)

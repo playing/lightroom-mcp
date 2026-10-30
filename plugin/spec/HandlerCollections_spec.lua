@@ -64,7 +64,7 @@ describe("HandlerCollections.listCollections", function()
 
         assert.are.equal(10, r.count)
         assert.are.same({ { name = "c5", gated = false }, { name = "c6", gated = false } }, reads)
-        assert.are.same({ name = "c6", type = "LrCollection", photoCount = 1 }, r.collections[2])
+        assert.are.same({ name = "c6", type = "LrCollection", isSmartCollection = true, photoCount = 1 }, r.collections[2])
     end)
 
     it("descends into collection sets and prefixes names", function()
@@ -78,7 +78,7 @@ describe("HandlerCollections.listCollections", function()
         local r = Handler.listCollections({})
         assert.are.equal(1, r.count)
         assert.are.equal("Outer / Inside", r.collections[1].name)
-        assert.are.equal("Outer", r.collections[1].parent)
+        assert.is_nil(r.collections[1].parent)
     end)
 end)
 
@@ -87,6 +87,7 @@ describe("HandlerCollections.createCollection", function()
         local catalog, Handler = setup({})
         local r = Handler.createCollection({ name = "New Album" })
         assert.is_true(r.success)
+        assert.is_nil(r.message)
         local created = catalog.getCreatedCollections()
         assert.are.equal(1, #created)
         assert.are.equal("New Album", created[1].getName())
@@ -133,7 +134,7 @@ describe("HandlerCollections.createCollection", function()
         local listed = Handler.listCollections({})
         assert.are.equal(1, listed.count)
         assert.are.equal("Trips / 2026 / Coast / City", listed.collections[1].name)
-        assert.are.equal("Coast", listed.collections[1].parent)
+        assert.is_nil(listed.collections[1].parent)
     end)
 
     it("reuses existing collection sets instead of duplicating them", function()
@@ -316,6 +317,83 @@ describe("HandlerCollections.createCollection", function()
     end)
 end)
 
+describe("HandlerCollections.createSmartCollection", function()
+    it("saves the same intersecting search description as searchPhotos", function()
+        local catalog, Handler = setup()
+        local args = { name = "Review", rating = 5, edited = false, focal_length = 35,
+            camera = "Test", keywords = { "Trip" }, start_date = "2026-01-01" }
+        local r = Handler.createSmartCollection(args)
+        local created = catalog:getCreatedCollections()[1]
+        assert.is_true(r.success)
+        assert.are.equal("Review", r.path)
+        assert.is_nil(r.message)
+        assert.is_true(created:isSmartCollection())
+        assert.are.same(require('HandlerSearch').buildSearchDesc(args), created:getSearchDescription())
+        assert.is_true(Handler.listCollections({}).collections[1].isSmartCollection)
+    end)
+
+    it("makes the smart collection readable only after its creating gate returns", function()
+        local catalog = helper.fakeCatalog()
+        local created
+        catalog:withWriteAccessDo("Create", function()
+            created = catalog:createSmartCollection("Review", { combine = "intersect",
+                { criteria = "rating", operation = "==", value = 5 } }, nil, false)
+            assert.has_error(function() created:getName() end,
+                "Smart collection is unavailable until its write gate returns")
+        end)
+        assert.are.equal("Review", created:getName())
+    end)
+
+    it("creates missing parent sets while reusing existing sets", function()
+        local trips = helper.fakeCollectionSet("Trips")
+        local catalog, Handler = setup({ collectionSets = { trips } })
+        local r = Handler.createSmartCollection({ name = "Review", parent = "Trips / 2026", rating = 5 })
+        assert.are.equal("Trips / 2026 / Review", r.path)
+        assert.are.equal(1, #catalog:getCreatedCollectionSets())
+        assert.is_true(trips:getChildCollectionSets()[1]:getChildCollections()[1]:isSmartCollection())
+    end)
+
+    it("rejects a duplicate name without creating anything", function()
+        local catalog, Handler = setup({ collections = { helper.fakeCollection("Review") } })
+        assert.has_error(function()
+            Handler.createSmartCollection({ name = "review", rating = 5 })
+        end, "Collection already exists: review")
+        assert.are.equal(0, #catalog:getCreatedCollections())
+        assert.are.equal(0, #catalog:getCreatedCollectionSets())
+    end)
+
+    it("rejects missing and invalid filters before creating parent sets", function()
+        local catalog, Handler = setup()
+        for _, args in ipairs({
+            { name = "Review", parent = "Trips / 2026" },
+            { name = "Review", parent = "Trips / 2026", keywords = {} },
+            { name = "Review", parent = "Trips / 2026", focal_length = 0 },
+            { name = "Review", parent = "Trips / 2026", edited = "false" },
+            { name = "Review", parent = "Trips / 2026", start_date = "2026-02-30" },
+        }) do
+            assert.has_error(function() Handler.createSmartCollection(args) end)
+        end
+        assert.are.equal(0, #catalog:getCreatedCollections())
+        assert.are.equal(0, #catalog:getCreatedCollectionSets())
+        assert.are.equal(0, catalog:getWriteAccessCount())
+    end)
+
+    it("accepts false and zero valued filters", function()
+        local catalog, Handler = setup()
+        Handler.createSmartCollection({ name = "Unedited", edited = false })
+        Handler.createSmartCollection({ name = "Unrated", rating = 0 })
+        assert.are.equal(2, #catalog:getCreatedCollections())
+    end)
+
+    it("reports an SDK creation failure", function()
+        local _, Handler = setup()
+        local catalog = import('LrApplication').activeCatalog()
+        catalog.createSmartCollection = function() return nil end
+        assert.has_error(function() Handler.createSmartCollection({ name = "Review", rating = 5 }) end,
+            "Lightroom did not create collection: Review")
+    end)
+end)
+
 describe("HandlerCollections.addToCollection", function()
     it("resolves photos OUTSIDE the write-access gate", function()
         local p1 = helper.fakePhoto({ id = "1", path = "/a.jpg" })
@@ -376,7 +454,7 @@ describe("HandlerCollections.addToCollection", function()
 
         assert.are.equal(1, r.added)
         assert.are.same({ "ghost" }, r.missing)
-        assert.is_not_nil(r.message:find("1 ids not found", 1, true))
+        assert.is_nil(r.message)
     end)
 
     it("adds to a nested collection addressed by its listed path", function()
@@ -564,7 +642,7 @@ describe("HandlerCollections.removeFromCollection", function()
 
         assert.are.equal(1, r.removed)
         assert.are.same({ "ghost" }, r.missing)
-        assert.is_not_nil(r.message:find("1 ids not found", 1, true))
+        assert.is_nil(r.message)
     end)
 
     it("rejects an unknown or smart collection without scanning the catalog", function()
@@ -604,6 +682,7 @@ describe("HandlerCollections.deleteCollection", function()
 
         assert.is_true(r.success)
         assert.are.equal(2, r.photo_count)
+        assert.are.equal("Photos stay in the catalog.", r.message)
         assert.is_true(target.isDeleted())
         assert.is_false(other.isDeleted())
     end)
@@ -689,9 +768,16 @@ describe("HandlerCollections.getCollectionPhotos", function()
         assert.are.equal(2, r.count)
         assert.is_false(r.has_more)
         assert.are.same({
-            id = "1", path = "/p1.jpg", filename = "p1.jpg", rating = 1, dateTimeOriginal = "2026-01-02",
+            id = "1", filename = "p1.jpg", rating = 1, dateTimeOriginal = "2026-01-02",
         }, r.photos[1])
         assert.are.equal("2", r.photos[2].id)
+        assert.are.same(r, Handler.getCollectionPhotos({ collection_name = "Trip", include_path = false }))
+        local full = Handler.getCollectionPhotos({ collection_name = "Trip", include_path = true })
+        assert.are.equal("/p1.jpg", full.photos[1].path)
+        assert.are.equal("/p2.jpg", full.photos[2].path)
+        full.photos[1].path = nil
+        full.photos[2].path = nil
+        assert.are.same(r, full)
     end)
 
     it("finds a collection nested two sets deep, by bare name or listed path", function()
@@ -701,7 +787,10 @@ describe("HandlerCollections.getCollectionPhotos", function()
             collectionSets = { set("Outer", {}, { set("Inner", { deep }) }) } })
 
         assert.are.equal(1, Handler.getCollectionPhotos({ collection_name = "Deep" }).count)
-        local listed = Handler.listCollections({}).collections[1].name
+        local row = Handler.listCollections({}).collections[1]
+        assert.are.same({ name = "Outer / Inner / Deep", type = "LrCollection",
+            isSmartCollection = false, photoCount = 1 }, row)
+        local listed = row.name
         assert.are.equal("Outer / Inner / Deep", listed)
         assert.are.equal("1", Handler.getCollectionPhotos({ collection_name = listed }).photos[1].id)
     end)

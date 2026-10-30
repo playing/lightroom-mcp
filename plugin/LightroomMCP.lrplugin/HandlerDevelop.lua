@@ -3,12 +3,14 @@ local LrDate = import 'LrDate'
 local LrDevelopController = import 'LrDevelopController'
 local LrFileUtils = import 'LrFileUtils'
 local LrPathUtils = import 'LrPathUtils'
+local LrStringUtils = import 'LrStringUtils'
 local LrTasks = import 'LrTasks'
 
 local AIMaskData = require 'AIMaskData'
 local PhotoLookup = require 'PhotoLookup'
 local DevelopSession = require 'DevelopSession'
 local Log = require 'Log'
+local JSON = require 'JSON'
 
 local DevelopHandler = {}
 
@@ -659,10 +661,27 @@ local function sortedSettingKeys(settings)
     return keys
 end
 
-function DevelopHandler.listDevelopPresets(_)
+function DevelopHandler.listDevelopPresets(args)
+    local limit = math.max(0, math.floor(tonumber(args.limit) or 100))
+    local offset = math.max(0, math.floor(tonumber(args.offset) or 0))
+    if args.query ~= nil then requireString(args.query, "query") end
+    if args.folder ~= nil then requireString(args.folder, "folder") end
+    local query = args.query and LrStringUtils.lower(args.query)
     local out = {}
+    local count = 0
     for _, entry in ipairs(allDevelopPresetEntries()) do
-        table.insert(out, presetSummary(entry))
+        if (not args.folder or entry.folder == args.folder)
+            and (not query or LrStringUtils.lower(entry.name or ""):find(query, 1, true)) then
+            count = count + 1
+            if count > offset and #out < limit then
+                table.insert(out, {
+                    name = entry.name,
+                    folder = entry.folder,
+                    scope = entry.scope,
+                    uuid = entry.uuid,
+                })
+            end
+        end
     end
 
     Log.info(string.format("Listed %d develop presets", #out))
@@ -670,7 +689,8 @@ function DevelopHandler.listDevelopPresets(_)
     return {
         success = true,
         presets = out,
-        count = #out,
+        count = count,
+        has_more = offset + #out < count,
     }
 end
 
@@ -766,8 +786,6 @@ function DevelopHandler.createDevelopPreset(args)
     local entry = presetEntry(preset, "Plugin Develop Presets", "plugin")
     local result = presetSummary(entry)
     result.success = true
-    result.source_photo_id = args.photo_id
-    result.settings = args.settings
     result.visible_in_develop = false
     result.message = "Created plugin-managed Develop preset checkpoint"
     Log.info(string.format("Created plugin preset %s from photo %s", args.preset_name, args.photo_id))
@@ -826,7 +844,7 @@ function DevelopHandler.exportDevelopPreset(args)
     return result
 end
 
-local AI_UPDATE_UNSUPPORTED_NOTE = "; AI mask update needs Lightroom Classic 13.3 or later"
+local AI_UPDATE_UNSUPPORTED_NOTE = "AI mask update needs Lightroom Classic 13.3 or later"
 
 local containsAIMasks = AIMaskData.containsAIMasks
 local withoutComputedAIMaskData = AIMaskData.withoutComputedData
@@ -860,19 +878,126 @@ local function recomputeAISettings(catalog, applied)
     return updated, failed, true
 end
 
-local function aiUpdateMessageSuffix(supported, failed)
+local function aiUpdateMessage(supported, failed)
     if not supported then
         return AI_UPDATE_UNSUPPORTED_NOTE
     end
     if #failed > 0 then
-        return string.format("; AI mask update failed for %d photos", #failed)
+        return string.format("AI mask update failed for %d photos", #failed)
     end
-    return ""
+    return nil
+end
+
+local DRY_RUN_DETAIL_LIMIT = 5
+local DRY_RUN_DETAIL_BUDGET = 12000
+local DRY_RUN_MISSING_BUDGET = 4000
+
+local function requireDryRun(args)
+    if args.dry_run ~= nil and type(args.dry_run) ~= "boolean" then
+        error("dry_run must be a boolean")
+    end
+end
+
+local function previewValue(value)
+    if type(value) == "table" then
+        local count = 0
+        for _ in pairs(value) do count = count + 1 end
+        return { type = "table", entries = count }
+    end
+    if type(value) == "string" and #value > 128 then
+        return { type = "string", length = #value, prefix = value:sub(1, 128) }
+    end
+    return value
+end
+
+local function previewDevelopSettings(catalog, resolved, settings, declaredPresetOnly)
+    local result = {
+        success = true,
+        dry_run = true,
+        targets = 0,
+        changed_targets = 0,
+        missing = {},
+        missing_count = 0,
+        missing_indices = {},
+        missing_truncated = false,
+        details = {},
+        detail_limit = DRY_RUN_DETAIL_LIMIT,
+        detail_truncated = false,
+        setting_totals = {},
+        masks_would_be_copied = settings.MaskGroupBasedCorrections ~= nil,
+        ai_recomputed = false,
+    }
+    if declaredPresetOnly then
+        result.preview_scope = "readable_declared_preset_settings"
+        result.unknown_current_totals = {}
+        result.unknown_effects = { "SDK-generated values, including GrainSeed", "Preset bookkeeping" }
+    end
+    local keys = sortedSettingKeys(settings)
+    local normalized = withoutVolatileIds(withoutComputedAIMaskData(settings))
+    local detailBytes, missingBytes = 0, 0
+    for index, entry in ipairs(resolved) do
+        if not entry.photo then
+            result.missing_count = result.missing_count + 1
+            result.missing_indices[#result.missing_indices + 1] = index
+            local id = tostring(entry.id)
+            local bytes = #JSON:encode(id)
+            if not result.missing_truncated and missingBytes + bytes <= DRY_RUN_MISSING_BUDGET then
+                result.missing[#result.missing + 1] = id
+                missingBytes = missingBytes + bytes
+            else
+                result.missing_truncated = true
+            end
+        else
+            result.targets = result.targets + 1
+            local current
+            catalog:withReadAccessDo(function() current = entry.photo:getDevelopSettings() end)
+            current = withoutVolatileIds(withoutComputedAIMaskData(current))
+            local detail = { id = tostring(entry.id), changes = {} }
+            local changed = false
+            for _, key in ipairs(keys) do
+                if declaredPresetOnly and current[key] == nil then
+                    result.unknown_current_totals[key] = (result.unknown_current_totals[key] or 0) + 1
+                elseif not deepEqual(current[key], normalized[key]) then
+                    changed = true
+                    result.setting_totals[key] = (result.setting_totals[key] or 0) + 1
+                    detail.changes[#detail.changes + 1] = {
+                        key = key,
+                        before_present = current[key] ~= nil,
+                        after_present = normalized[key] ~= nil,
+                        before = previewValue(current[key]),
+                        after = previewValue(normalized[key]),
+                    }
+                end
+            end
+            if changed then result.changed_targets = result.changed_targets + 1 end
+            if #result.details < DRY_RUN_DETAIL_LIMIT then
+                local bytes = #JSON:encode(detail)
+                if detailBytes + bytes <= DRY_RUN_DETAIL_BUDGET then
+                    result.details[#result.details + 1] = detail
+                    detailBytes = detailBytes + bytes
+                else
+                    result.detail_truncated = true
+                end
+            else
+                result.detail_truncated = true
+            end
+        end
+    end
+    while #result.details > 0 and #JSON:encode(result) > 20000 do
+        table.remove(result.details)
+        result.detail_truncated = true
+    end
+    while #result.missing > 0 and #JSON:encode(result) > 20000 do
+        table.remove(result.missing)
+        result.missing_truncated = true
+    end
+    return result
 end
 
 function DevelopHandler.applyDevelopPreset(args)
     args.photo_ids = requirePhotoIdArray(args.photo_ids, "photo_ids", MAX_BULK_PHOTO_IDS)
     local selectedPreset = findPreset(args)
+    requireDryRun(args)
 
     local catalog = LrApplication.activeCatalog()
     local appliedCount = 0
@@ -884,6 +1009,9 @@ function DevelopHandler.applyDevelopPreset(args)
     -- not write, so holding the exclusive gate across it only serializes
     -- every other handler behind it.
     local resolved = PhotoLookup.resolveMany(catalog, args.photo_ids)
+    if args.dry_run then
+        return previewDevelopSettings(catalog, resolved, normalizedPresetSettings(selectedPreset.preset), true)
+    end
     local applied = {}
 
     catalog:withWriteAccessDo("Apply Develop Preset", function()
@@ -921,8 +1049,7 @@ function DevelopHandler.applyDevelopPreset(args)
         missing = missingIds,
         ai_updated = aiUpdated,
         ai_update_failed = aiFailed,
-        message = string.format("Applied preset %s to %d photos (%d ids not found)",
-            selectedPreset.name, appliedCount, missingCount) .. aiUpdateMessageSuffix(aiSupported, aiFailed),
+        message = aiUpdateMessage(aiSupported, aiFailed),
     }
 end
 
@@ -930,6 +1057,7 @@ function DevelopHandler.copyDevelopSettings(args)
     args.source_id = requirePhotoId(args.source_id, "source_id")
     args.target_ids = requirePhotoIdArray(args.target_ids, "target_ids", MAX_BULK_PHOTO_IDS)
     requireDevelopSettingWhitelist(args.settings)
+    requireDryRun(args)
 
     local catalog = LrApplication.activeCatalog()
     local sourceSettings
@@ -957,6 +1085,9 @@ function DevelopHandler.copyDevelopSettings(args)
     local missingCount = 0
 
     local resolved = PhotoLookup.resolveMany(catalog, args.target_ids)
+    if args.dry_run then
+        return previewDevelopSettings(catalog, resolved, toApply)
+    end
     local applied = {}
 
     catalog:withWriteAccessDo("Copy Develop Settings", function()
@@ -983,13 +1114,86 @@ function DevelopHandler.copyDevelopSettings(args)
     return {
         success = true,
         copied = copiedCount,
-        source = args.source_id,
         missing = missingIds,
         ai_updated = aiUpdated,
         ai_update_failed = aiFailed,
-        message = string.format("Copied develop settings from %s to %d photos (%d ids not found)",
-            args.source_id, copiedCount, missingCount) .. aiUpdateMessageSuffix(aiSupported, aiFailed),
+        message = aiUpdateMessage(aiSupported, aiFailed),
     }
+end
+
+local styleMatchSerial = 0
+
+local function isStyleSetting(key)
+    return ALLOWED_DEVELOP_SETTING_LOOKUP[key]
+        and not key:match('^Crop') and not key:match('^Perspective')
+        and not key:match('^Lens')
+        and key ~= 'WhiteBalance' and key ~= 'Temperature' and key ~= 'Tint'
+end
+
+local function sameSetting(left, right)
+    if type(left) ~= type(right) then return false end
+    if type(left) ~= 'table' then return left == right end
+    for key, value in pairs(left) do
+        if not sameSetting(value, right[key]) then return false end
+    end
+    for key in pairs(right) do
+        if left[key] == nil then return false end
+    end
+    return true
+end
+
+function DevelopHandler.matchPhotoStyle(args)
+    local sourceId = requirePhotoId(args.reference_id, 'reference_id')
+    local targetIds = requirePhotoIdArray(args.target_ids, 'target_ids', MAX_BULK_PHOTO_IDS)
+    local catalog = LrApplication.activeCatalog()
+    local source = PhotoLookup.resolveOne(catalog, sourceId)
+    if not source then error('Reference photo not found: ' .. sourceId) end
+    local resolved = PhotoLookup.resolveMany(catalog, targetIds)
+    for _, entry in ipairs(resolved) do
+        if entry.photo and entry.photo.localIdentifier == source.localIdentifier then
+            error('Reference photo must not appear in target_ids')
+        end
+    end
+
+    local settings = {}
+    catalog:withReadAccessDo(function()
+        for key, value in pairs(source:getDevelopSettings()) do
+            if isStyleSetting(key) then settings[key] = value end
+        end
+    end)
+    local results, failures, missing = {}, {}, {}
+    local snapshots = require 'HandlerSnapshots'
+    for _, entry in ipairs(resolved) do
+        if not entry.photo then
+            missing[#missing + 1] = tostring(entry.id)
+        else
+            styleMatchSerial = styleMatchSerial + 1
+            local name = string.format('Style match from %s at %.3f #%d',
+                tostring(source.localIdentifier), LrDate.currentTime(), styleMatchSerial)
+            local snapshot
+            local ok, reason = LrTasks.pcall(function()
+                snapshot = snapshots.create({ photo_id = tostring(entry.photo.localIdentifier), name = name }).snapshot
+                local changed = 0
+                catalog:withReadAccessDo(function()
+                    local before = entry.photo:getDevelopSettings()
+                    for key, value in pairs(settings) do
+                        if not sameSetting(value, before[key]) then changed = changed + 1 end
+                    end
+                end)
+                catalog:withWriteAccessDo('Match Photo Style', function()
+                    entry.photo:applyDevelopSettings(settings)
+                end)
+                results[#results + 1] = {
+                    photo_id = tostring(entry.id), snapshot = snapshot, settings_changed = changed,
+                }
+            end)
+            if not ok then
+                failures[#failures + 1] = { photo_id = tostring(entry.id), reason = tostring(reason), snapshot = snapshot }
+            end
+        end
+    end
+    return { success = #failures == 0, reference_id = sourceId, matched = #results,
+        results = results, failures = failures, missing = missing }
 end
 
 function DevelopHandler.setDevelopSettings(args)
@@ -1220,7 +1424,6 @@ function DevelopHandler.applyDenoise(args, context)
     return {
         success = counts.failed == 0 and complete,
         complete = complete,
-        amount = amount,
         applied = counts.applied,
         amount_changed = counts.amount_changed,
         unchanged = counts.unchanged,
@@ -1235,6 +1438,103 @@ function DevelopHandler.applyDenoise(args, context)
                 "Stopped after %d s to stay within the request timeout; call again with remaining_ids.",
                 DENOISE_TIME_BUDGET_SECONDS),
     }
+end
+
+local PROCESS_VERSIONS = {
+    ["Version 1"] = 1, ["Version 2"] = 2, ["Version 3"] = 3,
+    ["Version 4"] = 4, ["Version 5"] = 5, ["Version 6"] = 6,
+}
+
+local function changeProcessVersion(catalog, photo, version, state)
+    DevelopSession.openPhoto(catalog, photo, state)
+    local previous = LrDevelopController.getProcessVersion()
+    local result = { previous_version = previous, new_version = previous }
+    if not PROCESS_VERSIONS[previous] then
+        result.status, result.reason = "failed", "Lightroom returned an unknown process version"
+        return result
+    end
+    if previous == version then
+        result.status = "unchanged"
+        return result
+    end
+    if PROCESS_VERSIONS[version] < PROCESS_VERSIONS[previous] then
+        local settings
+        catalog:withReadAccessDo(function() settings = photo:getDevelopSettings() end)
+        if type(settings) ~= "table" then
+            result.status, result.reason = "failed", "Could not check the photo's masks before downgrading"
+            return result
+        end
+        local masks = settings.MaskGroupBasedCorrections
+        if masks ~= nil and type(masks) ~= "table" then
+            result.status, result.reason = "failed", "Could not read the photo's masks before downgrading"
+            return result
+        end
+        if masks and next(masks) ~= nil then
+            result.status = "skipped"
+            result.reason = "Process-version downgrades are refused on photos with masks; keep the current version to preserve mask editing"
+            return result
+        end
+    end
+    if catalog:getTargetPhoto() ~= photo then
+        result.status, result.reason = "failed", "another photo became active before the version change"
+        return result
+    end
+    local ok, err = LrTasks.pcall(function() LrDevelopController.setProcessVersion(version) end)
+    local confirmed = ok and DevelopSession.waitFor(function()
+        return catalog:getTargetPhoto() == photo and LrDevelopController.getProcessVersion() == version
+    end, 5)
+    if catalog:getTargetPhoto() == photo then result.new_version = LrDevelopController.getProcessVersion() end
+    result.status = confirmed and "changed" or "failed"
+    if not confirmed then result.reason = ok and "Lightroom did not confirm the requested version" or tostring(err) end
+    return result
+end
+
+function DevelopHandler.setProcessVersion(args, context)
+    args.photo_ids = requirePhotoIdArray(args.photo_ids, "photo_ids", 100)
+    if not PROCESS_VERSIONS[args.version] then error("version must be Version 1 through Version 6") end
+    if args.confirm ~= true then error("confirm must be true; changing process versions can change a photo's look") end
+    if args.restore_selection ~= nil and type(args.restore_selection) ~= "boolean" then
+        error("restore_selection must be a boolean")
+    end
+    if type(LrDevelopController.getProcessVersion) ~= "function"
+        or type(LrDevelopController.setProcessVersion) ~= "function" then
+        error("set_process_version is unavailable in this Lightroom version")
+    end
+    local catalog = LrApplication.activeCatalog()
+    local started = LrDate.currentTime()
+    return DevelopSession.run("set_process_version", catalog, args.restore_selection ~= false, function(state)
+        local resolved = PhotoLookup.resolveMany(catalog, args.photo_ids)
+        local results, remaining, seen = {}, {}, {}
+        local counts = { changed = 0, unchanged = 0, skipped = 0, failed = 0 }
+        for _, entry in ipairs(resolved) do
+            local result
+            if #remaining > 0 or (context and context:isCanceled()) or LrDate.currentTime() - started >= 240 then
+                remaining[#remaining + 1] = tostring(entry.id)
+            elseif not entry.photo then
+                result = { status = "skipped", reason = "photo not found" }
+            elseif seen[entry.photo] then
+                result = { status = "skipped", reason = "duplicate" }
+            else
+                seen[entry.photo] = true
+                if context then context:report(#results, #resolved, tostring(entry.id)) end
+                local ok, value = LrTasks.pcall(changeProcessVersion, catalog, entry.photo, args.version, state)
+                result = ok and value or { status = "failed", reason = tostring(value) }
+            end
+            if result then
+                result.id = tostring(entry.id)
+                results[#results + 1] = result
+                counts[result.status] = counts[result.status] + 1
+            end
+        end
+        if context and #results > 0 then context:report(#results, #resolved, results[#results].id) end
+        local complete = #remaining == 0
+        return {
+            success = complete and counts.failed == 0, complete = complete,
+            changed = counts.changed, unchanged = counts.unchanged, skipped = counts.skipped, failed = counts.failed,
+            results = results, remaining_ids = not complete and remaining or nil,
+            seconds = math.floor((LrDate.currentTime() - started) * 10 + 0.5) / 10,
+        }
+    end)
 end
 
 local AUTO_TONE_KEYS = {
@@ -1350,6 +1650,67 @@ function DevelopHandler.applyAutoAdjustments(args)
             failed = counts.failed,
             results = results,
             remaining_ids = #remaining > 0 and remaining or nil,
+        }
+    end)
+end
+
+function DevelopHandler.resetDevelopAdjustments(args, context)
+    args.photo_ids = requirePhotoIdArray(args.photo_ids, "photo_ids", 100)
+    if args.confirm ~= true then error("confirm must be true to reset all develop adjustments") end
+    if type(LrDevelopController.resetAllDevelopAdjustments) ~= "function" then
+        error("Lightroom does not support resetAllDevelopAdjustments")
+    end
+    local catalog = LrApplication.activeCatalog()
+    local startedAt = LrDate.currentTime()
+    return DevelopSession.run("reset_develop_adjustments", catalog, true, function(state)
+        local resolved = PhotoLookup.resolveMany(catalog, args.photo_ids)
+        local results, remaining, seen = {}, {}, {}
+        local counts = { reset = 0, skipped = 0, failed = 0 }
+        for _, entry in ipairs(resolved) do
+            local result
+            if #remaining > 0 or (context and context:isCanceled())
+                or LrDate.currentTime() - startedAt >= 240 then
+                remaining[#remaining + 1] = tostring(entry.id)
+            elseif not entry.photo then
+                result = { status = "skipped", reason = "photo not found" }
+            elseif seen[entry.photo] then
+                result = { status = "skipped", reason = "duplicate" }
+            else
+                seen[entry.photo] = true
+                if context then context:report(#results, #resolved, tostring(entry.id)) end
+                local ok, err = LrTasks.pcall(function()
+                    DevelopSession.openPhoto(catalog, entry.photo, state)
+                    if LrDate.currentTime() - startedAt >= 240 or (context and context:isCanceled()) then
+                        return false
+                    end
+                    LrDevelopController.resetAllDevelopAdjustments()
+                    DevelopSession.flushPendingEdits()
+                    return true
+                end)
+                if ok and err == false then
+                    remaining[#remaining + 1] = tostring(entry.id)
+                else
+                    result = ok and { status = "reset" } or { status = "failed", reason = tostring(err) }
+                    result.id = tostring(entry.photo.localIdentifier)
+                end
+            end
+            if result then
+                result.id = result.id or tostring(entry.id)
+                counts[result.status] = counts[result.status] + 1
+                results[#results + 1] = result
+            end
+        end
+        if context and #results > 0 then context:report(#results, #resolved, results[#results].id) end
+        local complete = #remaining == 0
+        return {
+            success = counts.failed == 0 and complete,
+            complete = complete,
+            reset = counts.reset,
+            skipped = counts.skipped,
+            failed = counts.failed,
+            results = results,
+            remaining_ids = not complete and remaining or nil,
+            seconds = math.floor((LrDate.currentTime() - startedAt) * 10 + 0.5) / 10,
         }
     end)
 end

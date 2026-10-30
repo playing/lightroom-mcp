@@ -1228,11 +1228,13 @@ function DevelopHandler.setColorAdjustments(args)
     local catalog = LrApplication.activeCatalog()
     local applied = false
 
+    -- Path resolution can yield; finish it before holding catalog write access.
+    local photo = PhotoLookup.resolveOne(catalog, args.photo_id)
+    if not photo then
+        error("Photo not found: " .. args.photo_id)
+    end
+
     catalog:withWriteAccessDo("Set Color Adjustments", function()
-        local photo = PhotoLookup.resolveOne(catalog, args.photo_id)
-        if not photo then
-            error("Photo not found: " .. args.photo_id)
-        end
         photo:applyDevelopSettings(settings)
         applied = true
     end)

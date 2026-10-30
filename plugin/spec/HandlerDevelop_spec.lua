@@ -88,6 +88,40 @@ local function setup(opts)
     }
 end
 
+describe("HandlerDevelop.setColorAdjustments", function()
+    it("resolves path targets before taking the write gate and keeps color mappings", function()
+        local photo = helper.fakePhoto({ id = "11", path = "/color.jpg" })
+        local catalog, Handler = setup({ photos = { photo } })
+
+        local result = Handler.setColorAdjustments({ photo_id = "/color.jpg", adjustments = {
+            hsl = { Green = { Hue = -8, Saturation = 12, Luminance = 5 } },
+            color_grading = { Shadow = { Hue = 210, Sat = 6 }, Balance = 10 },
+            calibration = { Blue = { Saturation = 4 } },
+        } })
+
+        assert.is_true(result.success)
+        assert.is_false(catalog.getQueriedInsideReadAccess())
+        assert.is_false(catalog.getQueriedInsideWriteAccess())
+        assert.are.equal(1, catalog.getWriteAccessCount())
+        assert.are.same({
+            HueAdjustmentGreen = -8, SaturationAdjustmentGreen = 12, LuminanceAdjustmentGreen = 5,
+            SplitToningShadowHue = 210, SplitToningShadowSaturation = 6,
+            ColorGradeBalance = 10, SplitToningBalance = 10, BlueSaturation = 4,
+        }, photo:getRawMetadata("__appliedSettings"))
+    end)
+
+    it("does not take a write gate when a color target is missing", function()
+        local catalog, Handler = setup()
+        assert.has_error(function()
+            Handler.setColorAdjustments({ photo_id = "/missing.jpg", adjustments = {
+                hsl = { Blue = { Saturation = -5 } },
+            } })
+        end, "Photo not found: /missing.jpg")
+        assert.is_false(catalog.getQueriedInsideWriteAccess())
+        assert.are.equal(0, catalog.getWriteAccessCount())
+    end)
+end)
+
 describe("HandlerDevelop.listDevelopPresets", function()
     it("returns flat list with name + folder", function()
         local folders = {
